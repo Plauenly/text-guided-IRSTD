@@ -1,0 +1,73 @@
+diff --git a/components/text_prior.py b/components/text_prior.py
+--- a/components/text_prior.py
++++ b/components/text_prior.py
+@@ -174,7 +174,8 @@
+ 
+         if self.use_gate:
+             # 残差门控：alpha=0 时输出 == 输入（恒等），保证不破坏 baseline
+-            enhanced = feat + self.alpha * (weighted - feat)
++            # 注意：把 alpha 转成 feat.dtype，避免 AMP 下 fp32 参数把该层输出抬成 fp32
++            enhanced = feat + self.alpha.to(feat.dtype) * (weighted - feat)
+         else:
+             enhanced = weighted
+         return enhanced
+diff --git a/test_model.py b/test_model.py
+--- a/test_model.py
++++ b/test_model.py
+@@ -21,6 +21,8 @@
+ import math
+ from components.cal_mean_std import Calculate_mean_std
+ from utilts import access_model
++from components.text_prior import ClipTextEmbedder, attach_text_prior
++from components.text_prompts import SINGLE_FRAME_IR_PROMPTS
+ 
+ def read_txt(txt_path):
+     with open(txt_path, 'r') as file:
+@@ -41,6 +43,13 @@
+ test_dir_name = '********'  ## Replace with the folder name where the corresponding test model is located, such as 'MSDA__SIRST3__masks_coarse__2024-12-13_13-30-35'.  Since the timestamps are unique, you need the folder name you generated.
+ test_model_name = 'best_mIoU_checkpoint_' + test_dir_name + ".pth.tar"
+ ################################################
++
++# ==================== 文本先验开关（必须与训练时一致）====================
++# 训练时接了文本先验，测试也必须接，否则特征增强缺失、结果不可比。
++# 如果你要测试 baseline（未接文本先验）的 checkpoint，把这里改成 False。
++USE_TEXT_PRIOR = True
++TEXT_CLIP_MODEL = 'ViT-B/32'   # 与 train_model.py 保持一致，或本地 .pt 路径
++# =====================================================================
+ 
+ 
+ # Hyperparameters etc.
+@@ -155,9 +164,30 @@
+     )
+     model = model_func().to(DEVICE)
+ 
+-    model.load_state_dict({k.replace('module.', ''): v for k, v in
+-                           torch.load(test_model_path, map_location=DEVICE)[
+-                               'state_dict'].items()})
++    # ==================== 文本先验接入 ====================
++    # 必须与训练时一致，且要在 load_state_dict 之前接好，这样 text_prior.* 参数才有地方放。
++    if USE_TEXT_PRIOR:
++        _embedder = ClipTextEmbedder(
++            SINGLE_FRAME_IR_PROMPTS,
++            model_name_or_path=TEXT_CLIP_MODEL,
++            device=DEVICE if torch.cuda.is_available() else 'cpu',
++        )
++        attach_text_prior(model, _embedder.get(), choose_model=choose_model)
++    # ====================================================
++
++    state_dict = torch.load(test_model_path, map_location=DEVICE)['state_dict']
++    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
++    missing, unexpected = model.load_state_dict(state_dict, strict=False)
++    if missing or unexpected:
++        print('[WARN] 权重不完全匹配：')
++        print('  missing   :', sorted(missing)[:8], '...' if len(missing) > 8 else '')
++        print('  unexpected:', sorted(unexpected)[:8], '...' if len(unexpected) > 8 else '')
++        if any(k.startswith('text_prior.') for k in missing):
++            print('  提示：missing 中包含 text_prior.*，说明该 checkpoint 是 baseline(未接文本先验) 训练的，'
++                  '请把 USE_TEXT_PRIOR 设为 False 再测试。')
++        if any(k.startswith('text_prior.') for k in unexpected):
++            print('  提示：unexpected 中包含 text_prior.*，说明该 checkpoint 是接了文本先验训练的，'
++                  '请把 USE_TEXT_PRIOR 设为 True 再测试。')
+     model.eval()
+ 
+     temp_num = 0

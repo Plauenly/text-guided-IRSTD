@@ -1,0 +1,14 @@
+# 数据集与工作池（790MB+，训练中还会变）
+/PAL-main/dataset/
+
+# 模型权重（每个几百 MB）
+/PAL-main/work_dirs/**/*.pth.tar
+/PAL-main/work_dirs/**/*.pth
+
+# 可视化产物
+/PAL-main/imgs/*.png
+
+# 缓存
+__pycache__/
+*.py[cod]
+.vscode

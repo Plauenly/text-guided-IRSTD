@@ -1,0 +1,826 @@
+diff --git a/train_model.py b/train_model.py
+--- a/train_model.py
++++ b/train_model.py
+@@ -18,6 +18,8 @@
+ from components.metric_new_crop import *
+ from loss.Edge_loss import edgeSCE_loss
+ from utilts import *
++from components.text_prior import ClipTextEmbedder, attach_text_prior
++from components.text_prompts import SINGLE_FRAME_IR_PROMPTS
+ 
+ import cv2
+ from torch.utils.data import Dataset
+@@ -67,6 +69,17 @@
+ thresh_Tb = 0.5
+ thresh_k = 0.5
+ degen = 0.97
++
++## ==================== 文本先验（TATE）相关开关 ====================
++## 只做特征增强的快速验证：文本先验经 CLIP 文本塔编码后，通过 forward hook
++## 注入到 MSDA 的 bottleneck(stage.layer5_4)，对特征做注意力式残差增强。
++USE_TEXT_PRIOR = True          # False -> 完全等价于原版 PAL（baseline）
++TEXT_PRIOR_RANDOM = False      # True  -> 用随机文本嵌入（关键消融：验证文本是否真的携带信息）
++TEXT_CLIP_MODEL = 'ViT-B/32'   # 或本地权重路径，如 '/path/to/ViT-B-32.pt'
++TEXT_PRIOR_HIDDEN = 256        # f_mlp 隐层维度
++TEXT_PRIOR_USE_GATE = True     # 残差门控 alpha，保证初期不破坏 baseline
++TEXT_PRIOR_GATE_INIT = 0.0     # alpha 初值，0 = 初始等价恒等映射
++## =================================================================
+ 
+ ## 根据给定的choose_model, choose_dataset, choose_dataset_type生成对应文件夹作为工作空间,且加一个时间码确保文件夹的独一无二性,不存在覆盖问题 
+ MODEL_NAME = choose_model + '__' + choose_dataset + '__' + choose_dataset_type 
+@@ -384,6 +397,33 @@
+     else:
+         model = model_func().to(DEVICE)
+ 
++    # ==================== 文本先验(TATE)接入 ====================
++    # 说明：必须在 optimizer 之前接入，且以 model.add_module 注册，
++    #      这样下面 AdamW(model.parameters()) 才能自动包含文本模块的参数。
++    if USE_TEXT_PRIOR:
++        _embedder = ClipTextEmbedder(
++            SINGLE_FRAME_IR_PROMPTS,
++            model_name_or_path=TEXT_CLIP_MODEL,
++            device=DEVICE,
++        )
++        text_embedding = _embedder.get()          # [N, 512]
++
++        if TEXT_PRIOR_RANDOM:
++            # 消融用：同形状随机向量，参数量/结构与真实文本完全一致
++            _g = torch.Generator().manual_seed(0)
++            text_embedding = torch.randn(text_embedding.shape, generator=_g)
++            print('[TextPrior] **消融模式**：使用随机文本嵌入（random text embedding）')
++
++        attach_text_prior(
++            model,
++            text_embedding,
++            choose_model=choose_model,
++            hidden_dim=TEXT_PRIOR_HIDDEN,
++            use_gate=TEXT_PRIOR_USE_GATE,
++            gate_init=TEXT_PRIOR_GATE_INIT,
++        )
++    # =========================================================
++
+     loss_fn = edgeSCE_loss
+     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+ 
+diff --git a/test_model.py b/test_model.py
+--- a/test_model.py
++++ b/test_model.py
+@@ -21,6 +21,8 @@
+ import math
+ from components.cal_mean_std import Calculate_mean_std
+ from utilts import access_model
++from components.text_prior import ClipTextEmbedder, attach_text_prior
++from components.text_prompts import SINGLE_FRAME_IR_PROMPTS
+ 
+ def read_txt(txt_path):
+     with open(txt_path, 'r') as file:
+@@ -41,6 +43,13 @@
+ test_dir_name = '********'  ## Replace with the folder name where the corresponding test model is located, such as 'MSDA__SIRST3__masks_coarse__2024-12-13_13-30-35'.  Since the timestamps are unique, you need the folder name you generated.
+ test_model_name = 'best_mIoU_checkpoint_' + test_dir_name + ".pth.tar"
+ ################################################
++
++# ==================== 文本先验开关（必须与训练时一致）====================
++# 训练时接了文本先验，测试也必须接，否则特征增强缺失、结果不可比。
++# 如果你要测试 baseline（未接文本先验）的 checkpoint，把这里改成 False。
++USE_TEXT_PRIOR = True
++TEXT_CLIP_MODEL = 'ViT-B/32'   # 与 train_model.py 保持一致，或本地 .pt 路径
++# =====================================================================
+ 
+ 
+ # Hyperparameters etc.
+@@ -155,9 +164,30 @@
+     )
+     model = model_func().to(DEVICE)
+ 
+-    model.load_state_dict({k.replace('module.', ''): v for k, v in
+-                           torch.load(test_model_path, map_location=DEVICE)[
+-                               'state_dict'].items()})
++    # ==================== 文本先验接入 ====================
++    # 必须与训练时一致，且要在 load_state_dict 之前接好，这样 text_prior.* 参数才有地方放。
++    if USE_TEXT_PRIOR:
++        _embedder = ClipTextEmbedder(
++            SINGLE_FRAME_IR_PROMPTS,
++            model_name_or_path=TEXT_CLIP_MODEL,
++            device=DEVICE if torch.cuda.is_available() else 'cpu',
++        )
++        attach_text_prior(model, _embedder.get(), choose_model=choose_model)
++    # ====================================================
++
++    state_dict = torch.load(test_model_path, map_location=DEVICE)['state_dict']
++    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
++    missing, unexpected = model.load_state_dict(state_dict, strict=False)
++    if missing or unexpected:
++        print('[WARN] 权重不完全匹配：')
++        print('  missing   :', sorted(missing)[:8], '...' if len(missing) > 8 else '')
++        print('  unexpected:', sorted(unexpected)[:8], '...' if len(unexpected) > 8 else '')
++        if any(k.startswith('text_prior.') for k in missing):
++            print('  提示：missing 中包含 text_prior.*，说明该 checkpoint 是 baseline(未接文本先验) 训练的，'
++                  '请把 USE_TEXT_PRIOR 设为 False 再测试。')
++        if any(k.startswith('text_prior.') for k in unexpected):
++            print('  提示：unexpected 中包含 text_prior.*，说明该 checkpoint 是接了文本先验训练的，'
++                  '请把 USE_TEXT_PRIOR 设为 True 再测试。')
+     model.eval()
+ 
+     temp_num = 0
+diff --git a/model/MSDA/MSDA_no_sigmoid.py b/model/MSDA/MSDA_no_sigmoid.py
+--- a/model/MSDA/MSDA_no_sigmoid.py
++++ b/model/MSDA/MSDA_no_sigmoid.py
+@@ -56,7 +56,7 @@
+             dx = dx.view(B, 1, -1, H, W)
+             dx = dx.transpose(1, 2).reshape(B, -1, H, W)  
+             filters = w_lh  # torch.Size([3, 1, 2, 2])
+-            filters = filters.repeat(C, 1, 1, 1).to(dtype=torch.float16)  
++            filters = filters.repeat(C, 1, 1, 1).to(dtype=dx.dtype)  
+             dx = torch.nn.functional.conv_transpose2d(dx, filters, stride=1, groups=C)
+             dx = torch.cat((dx[:, :, :0], dx[:, :, 1:]), dim=2)  
+             dx = torch.cat((dx[:, :, :, :0], dx[:, :, :, 1:]), dim=3)  
+@@ -100,7 +100,7 @@
+             dx = dx.view(B, 1, -1, H, W)
+             dx = dx.transpose(1, 2).reshape(B, -1, H, W)  
+             filters = w_hl
+-            filters = filters.repeat(C, 1, 1, 1).to(dtype=torch.float16) 
++            filters = filters.repeat(C, 1, 1, 1).to(dtype=dx.dtype) 
+             dx = torch.nn.functional.conv_transpose2d(dx, filters, stride=1, groups=C)
+             dx = torch.cat((dx[:, :, :0], dx[:, :, 1:]), dim=2)  
+             dx = torch.cat((dx[:, :, :, :0], dx[:, :, :, 1:]), dim=3)  
+@@ -143,7 +143,7 @@
+             dx = dx.view(B, 1, -1, H, W)
+             dx = dx.transpose(1, 2).reshape(B, -1, H, W)  
+             filters = w_hh  # torch.Size([3, 1, 2, 2])
+-            filters = filters.repeat(C, 1, 1, 1).to(dtype=torch.float16)  
++            filters = filters.repeat(C, 1, 1, 1).to(dtype=dx.dtype)  
+             dx = torch.nn.functional.conv_transpose2d(dx, filters, stride=1, groups=C)
+             dx = torch.cat((dx[:, :, :0], dx[:, :, 1:]), dim=2)  
+             dx = torch.cat((dx[:, :, :, :0], dx[:, :, :, 1:]), dim=3)  
+@@ -186,7 +186,7 @@
+             dx = dx.view(B, 1, -1, H, W)
+             dx = dx.transpose(1, 2).reshape(B, -1, H, W)  
+             filters = w_ll  # torch.Size([3, 1, 2, 2])
+-            filters = filters.repeat(C, 1, 1, 1).to(dtype=torch.float16)  
++            filters = filters.repeat(C, 1, 1, 1).to(dtype=dx.dtype)  
+             dx = torch.nn.functional.conv_transpose2d(dx, filters, stride=1, groups=C)
+             dx = torch.cat((dx[:, :, :0], dx[:, :, 1:]), dim=2) 
+             dx = torch.cat((dx[:, :, :, :0], dx[:, :, :, 1:]), dim=3)  
+@@ -318,7 +318,7 @@
+             dx = dx.view(B, 3, -1, H // 2, W // 2)
+             dx = dx.transpose(1, 2).reshape(B, -1, H // 2, W // 2)
+             filters = torch.cat([w_lh, w_hl, w_hh], dim=0)
+-            filters = filters.repeat(C, 1, 1, 1).to(dtype=torch.float16)
++            filters = filters.repeat(C, 1, 1, 1).to(dtype=dx.dtype)
+             dx = torch.nn.functional.conv_transpose2d(dx, filters, stride=2, groups=C)
+ 
+         return dx, None, None, None, None
+diff --git a/components/text_prompts.py b/components/text_prompts.py
+new file mode 100644
+--- /dev/null
++++ b/components/text_prompts.py
+@@ -0,0 +1,66 @@
++# -*- coding: utf-8 -*-
++"""
++单帧红外小目标 —— 文本 prompt 定义（文本先验知识）
++
++来源：SeViL (AAAI'26) 的 prompt 列表（见 SeViL/mmdet/models/necks/fpn.py:678-724 的 Target3 版本）。
++本文件仅做「单帧化裁剪」：删除所有依赖多帧/运动/时序的条目，保留下来的表述本身不变。
++
++被删除的 SeViL 原始 prompt（多帧专属，单帧设定下不成立）：
++    1) "The target may show slight movement, often revealing a simple trajectory in
++        frames, but may be jittery due to background interference."
++       —— 依赖帧间运动。
++    2) "The target's brightness intensity may slightly fluctuate across frames but
++        overall the target region will still be brighter than the background."
++       —— 依赖跨帧亮度波动。
++    3) "The target may maintain a certain stability in multi-frame images, but slight
++        jitter may occur due to noise and background interference."
++       —— 依赖多帧稳定性。
++
++其余 prompt 原样保留（顺序与 SeViL 保持一致，便于对照）。
++"""
++
++# =============================================================================
++# 主用 prompt 集（10 条，单帧适用）
++# =============================================================================
++SINGLE_FRAME_IR_PROMPTS = [
++    # 亮度 / 温度：目标通常比背景亮，温差明显
++    "The target is usually brighter than the surrounding background, with a higher temperature, making it stand out in the image.",
++    # 形状：受噪声干扰形状不规则、边缘模糊
++    "The target shape is irregular due to background noise and surrounding interference, showing blurred edge contours.",
++    # 尺寸：只占几个到十几个像素
++    "The target occupies only a few pixels in the image, typically ranging from several to a dozen pixels.",
++    # 对比度：与背景有对比度，因而更突出
++    "The target often has a contrast with the background, making it more prominent in the image.",
++    # 热源特性：与背景温度差异显著
++    "The target typically as a thermal source has distinct temperature characteristics, with a significant difference from the background temperature.",
++    # 孤立性：周围没有其他显著特征点
++    "The target is usually isolated in the image, with no other significant feature points around it.",
++    # 易被淹没：亮度和信号弱于背景噪声
++    "The target is prone to being obscured, due to the low brightness and the weak signal compared to background noise.",
++    # 纹理相似：灰度模糊，与背景纹理相近
++    "The target has a surface texture similar to the background, appearing gray and blurry, indicating its temperature.",
++    # 语义类别：热源/飞机/车辆等感兴趣目标
++    "The target is specific types of objects, such as heat sources, aircraft, vehicles, etc., that are parts of interest in the scene.",
++    # 信噪比：信噪比低，难以从背景噪声中检测
++    "The target typically has a low signal-to-noise ratio, making it harder to detect from background noise.",
++]
++
++
++# =============================================================================
++# 备用：精简 prompt 集（4 条）—— 用于 prompt 数量的消融实验
++# =============================================================================
++SINGLE_FRAME_IR_PROMPTS_MINIMAL = [
++    "The target is usually brighter than the surrounding background, with a higher temperature, making it stand out in the image.",
++    "The target occupies only a few pixels in the image, typically ranging from several to a dozen pixels.",
++    "The target typically has a low signal-to-noise ratio, making it harder to detect from background noise.",
++    "The target is usually isolated in the image, with no other significant feature points around it.",
++]
++
++
++# =============================================================================
++# 备用：只保留"尺寸 + 亮度"两条（最保守的先验）
++# =============================================================================
++SINGLE_FRAME_IR_PROMPTS_TINY = [
++    "The target is usually brighter than the surrounding background, with a higher temperature, making it stand out in the image.",
++    "The target occupies only a few pixels in the image, typically ranging from several to a dozen pixels.",
++]
+diff --git a/components/text_prior.py b/components/text_prior.py
+new file mode 100644
+--- /dev/null
++++ b/components/text_prior.py
+@@ -0,0 +1,267 @@
++# -*- coding: utf-8 -*-
++"""
++文本先验特征增强模块（Text-guided Adaptive Target Enhancing, TATE 风格）
++
++设计来源：SeViL (AAAI'26) 的 TextGuidedAttention2
++    SeViL/mmdet/models/necks/fpn.py:663-767
++
++本文件针对 PAL（单帧 + 点监督）所做的改造：
++    1. 通道自适应：SeViL 中文本嵌入与视觉特征同为 256 维，可直接 expand_as；
++       PAL 的 MSDA bottleneck 只有 64 维，因此 mlp_vis 输出维度改为 feat_dim。
++    2. 文本嵌入预先编码并缓存为 buffer：SeViL 每次 forward 都重新 encode_text，
++       这里只在初始化时算一次，训练零额外开销。
++    3. 增加可选的残差门控 alpha（默认开启，初值 0）：
++       保证训练初期该模块等价于恒等映射，不会破坏 baseline 的收敛，
++       再让网络自己学习"要不要用文本先验"。
++    4. 零侵入接入：通过 forward hook 注入到指定层，不修改任何模型源码。
++
++数值流程（与论文 Eq.1-3 对应）：
++    E  = CLIP_text(prompts)                     # [N, 512]
++    Ep = f_exp( mean_i( f_mlp(E_i) ) )          # f_mlp: 线性层, f_exp: 空间广播
++    G  = Softmax( f_c( M ⊙ Ep ) )               # f_c: 1x1 卷积 + 空间 softmax
++    M_E = f_c( G ⊙ M + M )                      # f_c: 1x1 卷积
++"""
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++
++# =============================================================================
++# 1. CLIP 文本嵌入器：加载 CLIP 文本塔，把 prompt 列表编码成 E ∈ R^{N×D}
++# =============================================================================
++class ClipTextEmbedder:
++    """加载 CLIP，把固定 prompt 编码为文本嵌入并缓存；编码后立即释放 CLIP 以省显存。
++
++    Args:
++        prompts (list[str]): 文本 prompt 列表，长度为 N。
++        model_name_or_path (str): 'ViT-B/32' 之类的模型名（会自动下载），
++            或本地权重文件路径（如 '/path/to/ViT-B-32.pt'）。
++        device (str): 'cuda' 或 'cpu'。
++        verbose (bool): 是否打印加载信息。
++    """
++
++    def __init__(self, prompts, model_name_or_path='ViT-B/32', device='cuda', verbose=True):
++        try:
++            import clip
++        except ImportError as e:
++            raise ImportError(
++                "\n[TextPrior] 未找到 `clip` 包。请先安装 openai-clip：\n"
++                "    pip install ftfy regex\n"
++                "    pip install git+https://github.com/openai/CLIP.git\n"
++                "或参见 TEXT_PRIOR_README.md 的离线权重说明。\n"
++            ) from e
++
++        if len(prompts) == 0:
++            raise ValueError('[TextPrior] prompts 不能为空。')
++
++        self.device = device
++        if verbose:
++            print(f'[TextPrior] 加载 CLIP 文本塔: {model_name_or_path} (device={device})')
++
++        # clip.load 在给模型名时自动下载到 ~/.cache/clip；给本地路径时直接加载
++        clip_model, _ = clip.load(model_name_or_path, device=device)
++        clip_model.eval()
++        for p in clip_model.parameters():
++            p.requires_grad_(False)
++
++        tokens = clip.tokenize(prompts).to(device)
++        with torch.no_grad():
++            text_features = clip_model.encode_text(tokens)   # [N, 512]，CLIP 默认 fp16
++
++        # 统一转 fp32 保存；CLIP 之后不再需要，释放显存
++        self.text_features = text_features.detach().float().cpu()
++        del clip_model
++        if device.startswith('cuda'):
++            torch.cuda.empty_cache()
++
++        if verbose:
++            print(f'[TextPrior] 文本嵌入已缓存: shape={tuple(self.text_features.shape)}，'
++                  f'CLIP 已释放。')
++
++    def get(self):
++        """返回缓存的文本嵌入 [N, 512]（CPU, float32）。"""
++        return self.text_features
++
++
++# =============================================================================
++# 2. 文本先验注意力模块（TATE）
++# =============================================================================
++class TextPriorAttention(nn.Module):
++    """用文本先验生成空间注意力图，对视觉特征做残差加权增强。
++
++    Args:
++        feat_dim (int): 被增强特征的通道数（MSDA bottleneck = 64）。
++        text_dim (int): 文本嵌入维度（CLIP ViT-B/32 = 512）。
++        hidden_dim (int): f_mlp 隐层维度。
++        use_gate (bool): 是否使用残差门控 alpha（推荐 True，训练更稳）。
++        gate_init (float): alpha 初值，0 表示初始等价恒等映射。
++    """
++
++    def __init__(self, feat_dim, text_dim=512, hidden_dim=256,
++                 use_gate=True, gate_init=0.0):
++        super().__init__()
++        self.feat_dim = feat_dim
++        self.text_dim = text_dim
++        self.use_gate = use_gate
++
++        # f_mlp: 文本 -> 视觉特征子空间（输出维度对齐 feat_dim，便于逐元素相乘）
++        self.mlp_vis = nn.Sequential(
++            nn.Linear(text_dim, hidden_dim),
++            nn.LeakyReLU(),
++            nn.Linear(hidden_dim, feat_dim),
++        )
++
++        # f_c: 相似度图 -> 单通道注意力
++        self.similarity_mlp = nn.Conv2d(feat_dim, 1, 1, bias=False)
++        # f_c: 融合后的通道重标定
++        self.reweight = nn.Conv2d(feat_dim, feat_dim, 1, bias=False)
++
++        # 文本嵌入缓存；初始为空，随后由 set_text_embedding 填入
++        self.register_buffer('text_embedding', torch.zeros(0, text_dim), persistent=False)
++
++        if use_gate:
++            self.alpha = nn.Parameter(torch.tensor(float(gate_init)))
++
++        self._last_attention = None   # 便于调试/可视化
++
++    # ------------------------------------------------------------------ #
++    def set_text_embedding(self, text_embedding):
++        """填入预编码的文本嵌入 E ∈ R^{N×D}。"""
++        assert text_embedding.dim() == 2 and text_embedding.size(1) == self.text_dim, \
++            f'期望文本嵌入形状 [N,{self.text_dim}]，实际得到 {tuple(text_embedding.shape)}'
++        self.text_embedding = text_embedding.detach().float()
++
++    # ------------------------------------------------------------------ #
++    def compute_attention(self, feat):
++        """计算注意力图 G（Eq.1 + Eq.2）。
++
++        Args:
++            feat: [B, feat_dim, H, W]
++        Returns:
++            attention_map: [B, 1, H, W]，空间维 softmax 归一化
++        """
++        # ---- Eq.1: E -> f_mlp -> 平均 -> 广播为 E_p ----
++        text = self.text_embedding.to(device=feat.device, dtype=torch.float32)
++        text = self.mlp_vis(text)                      # [N, feat_dim]
++        text = text.mean(dim=0)                        # [feat_dim]  (1/N)Σ
++        text = text.view(1, -1, 1, 1)
++        text = text.expand_as(feat)                    # [B, feat_dim, H, W]
++
++        # ---- Eq.2: M ⊙ E_p -> 1x1 conv -> 空间 softmax ----
++        similarity = feat.to(torch.float32) * text     # [B, feat_dim, H, W]
++        attention_map = self.similarity_mlp(similarity)  # [B, 1, H, W]
++        attention_map = F.softmax(
++            attention_map.flatten(2), dim=-1
++        ).view_as(attention_map)                       # G
++        return attention_map
++
++    # ------------------------------------------------------------------ #
++    def forward(self, feat):
++        """增强视觉特征。
++
++        Args:
++            feat: [B, feat_dim, H, W]
++        Returns:
++            enhanced: [B, feat_dim, H, W]
++        """
++        attention_map = self.compute_attention(feat)
++        self._last_attention = attention_map.detach()
++
++        # ---- Eq.3: M_E = f_c(G ⊙ M + M) ----
++        weighted = attention_map.to(feat.dtype) * feat + feat
++        weighted = self.reweight(weighted)
++
++        if self.use_gate:
++            # 残差门控：alpha=0 时输出 == 输入（恒等），保证不破坏 baseline
++            # 注意：把 alpha 转成 feat.dtype，避免 AMP 下 fp32 参数把该层输出抬成 fp32
++            enhanced = feat + self.alpha.to(feat.dtype) * (weighted - feat)
++        else:
++            enhanced = weighted
++        return enhanced
++
++
++# =============================================================================
++# 3. 零侵入接入：通过 forward hook 把文本注意力插到模型的指定层
++# =============================================================================
++# 每个模型需要指定：注入层的模块路径、该层输出通道数
++MODEL_TEXT_PRIOR_CFG = {
++    # MSDA: Stage 的最后一层 layer5_4 输出即 bottleneck（64 通道）
++    # 调用链：MSDA_No_Sigmoid.stage(Stage).layer5_4
++    'MSDA': dict(layer_name='stage.layer5_4', feat_dim=64),
++    # 其他模型待扩展（需要先确认其 bottleneck 的模块路径与通道数）
++    # 'ACM':  dict(layer_name='...', feat_dim=...),
++    # 'ALC':  dict(layer_name='...', feat_dim=...),
++    # 'MLCL': dict(layer_name='...', feat_dim=...),
++    # 'ALCL': dict(layer_name='...', feat_dim=...),
++    # 'GGL':  dict(layer_name='...', feat_dim=...),
++    # 'DNA':  dict(layer_name='...', feat_dim=...),
++    # 'UIU':  dict(layer_name='...', feat_dim=...),
++}
++
++
++def attach_text_prior(model, text_embedding, choose_model='MSDA',
++                      hidden_dim=256, use_gate=True, gate_init=0.0,
++                      verbose=True):
++    """把 TextPriorAttention 以 forward hook 形式挂到模型上（不修改模型源码）。
++
++    注意：模块通过 model.add_module() 注册，因此 model.parameters() 会自动包含它，
++          train_model.py 里原有的 optimizer = AdamW(model.parameters()) 无需改动。
++
++    Args:
++        model (nn.Module): 已构建好的分割网络（如 MSDA_No_Sigmoid）。
++        text_embedding (Tensor): ClipTextEmbedder.get() 的返回值，[N, 512]。
++        choose_model (str): 模型名，用于查 MODEL_TEXT_PRIOR_CFG。
++        hidden_dim (int): f_mlp 隐层维度。
++        use_gate (bool): 是否使用残差门控。
++        gate_init (float): 门控初值。
++        verbose (bool): 是否打印接入信息。
++
++    Returns:
++        (TextPriorAttention, hook_handle)
++    """
++    if choose_model not in MODEL_TEXT_PRIOR_CFG:
++        raise NotImplementedError(
++            f'[TextPrior] 模型 {choose_model} 尚未配置注入层。'
++            f'请在 components/text_prior.py 的 MODEL_TEXT_PRIOR_CFG 中补充 '
++            f'layer_name 与 feat_dim。目前已支持: {list(MODEL_TEXT_PRIOR_CFG.keys())}'
++        )
++
++    cfg = MODEL_TEXT_PRIOR_CFG[choose_model]
++    text_attn = TextPriorAttention(
++        feat_dim=cfg['feat_dim'],
++        text_dim=text_embedding.size(1),
++        hidden_dim=hidden_dim,
++        use_gate=use_gate,
++        gate_init=gate_init,
++    )
++    text_attn.set_text_embedding(text_embedding)
++
++    # 与主模型放到同一 device（model.to(DEVICE) 之后再 add_module 不会自动迁移）
++    try:
++        model_device = next(model.parameters()).device
++        text_attn = text_attn.to(model_device)
++    except StopIteration:
++        pass
++
++    # 注册为子模块，使 model.parameters() 覆盖其参数
++    model.add_module('text_prior', text_attn)
++
++    # 定位目标层
++    target = model
++    for attr in cfg['layer_name'].split('.'):
++        target = getattr(target, attr)
++
++    # forward hook：用模块输出替换该层的输出
++    def _hook(layer, inputs, output):
++        return text_attn(output)
++
++    handle = target.register_forward_hook(_hook)
++
++    if verbose:
++        n_params = sum(p.numel() for p in text_attn.parameters())
++        print(f'[TextPrior] 已接入 {choose_model}: '
++              f'注入层={cfg["layer_name"]}, feat_dim={cfg["feat_dim"]}, '
++              f'可训练参数={n_params} (~{n_params/1e3:.2f}K), '
++              f'gate={use_gate}(init={gate_init})')
++    return text_attn, handle
+diff --git a/tools/test_text_prior.py b/tools/test_text_prior.py
+new file mode 100644
+--- /dev/null
++++ b/tools/test_text_prior.py
+@@ -0,0 +1,127 @@
++# -*- coding: utf-8 -*-
++"""
++文本先验模块自检脚本（不依赖数据集，纯随机张量）。
++
++用法：
++    cd /workspace/PAL+TATE/PAL-main
++    python tools/test_text_prior.py                 # 只测模块与 MSDA 接入（不需要 CLIP 权重）
++    python tools/test_text_prior.py --with_clip     # 额外测试 CLIP 文本嵌入（需要 clip 包 + 权重）
++"""
++
++import os
++import sys
++import argparse
++
++# 把 PAL-main 根目录加入 sys.path，保证能 import components / model
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++if ROOT not in sys.path:
++    sys.path.insert(0, ROOT)
++
++import torch
++
++from components.text_prior import (
++    TextPriorAttention,
++    attach_text_prior,
++    MODEL_TEXT_PRIOR_CFG,
++)
++
++
++def test_attention_module():
++    print('\n[Test 1] TextPriorAttention 单模块 ------------------------------------')
++    feat_dim, text_dim, N = 64, 512, 10
++    m = TextPriorAttention(feat_dim=feat_dim, text_dim=text_dim, use_gate=True, gate_init=0.0)
++    m.set_text_embedding(torch.randn(N, text_dim))
++    m.eval()
++
++    x = torch.randn(2, feat_dim, 16, 16)
++    with torch.no_grad():
++        y = m(x)
++
++    assert y.shape == x.shape, f'输出形状应为 {tuple(x.shape)}，实际 {tuple(y.shape)}'
++    print(f'  输入 {tuple(x.shape)} -> 输出 {tuple(y.shape)}  OK')
++    print(f'  注意力图 _last_attention: {tuple(m._last_attention.shape)}  OK')
++
++    # gate_init=0 时，初始化应严格等价于恒等映射
++    assert torch.allclose(y, x, atol=1e-6), 'gate_init=0 时输出应等于输入'
++    print('  gate_init=0 -> 恒等映射校验通过  OK')
++
++    # 门控可学习
++    assert m.alpha.requires_grad, 'alpha 应可训练'
++    print('  alpha 可训练  OK')
++
++    # 注意力图空间维应归一化（和为 1）
++    s = m._last_attention.flatten(2).sum(dim=-1)
++    assert torch.allclose(s, torch.ones_like(s), atol=1e-5), '空间 softmax 未归一化'
++    print('  空间 softmax 归一化校验通过  OK')
++
++
++def test_msda_integration():
++    print('\n[Test 2] MSDA + forward hook 接入 -------------------------------------')
++    from model.MSDA.MSDA_no_sigmoid import MSDA_No_Sigmoid
++
++    model = MSDA_No_Sigmoid()
++    n_before = sum(p.numel() for p in model.parameters())
++
++    attach_text_prior(model, torch.randn(10, 512), choose_model='MSDA', verbose=True)
++
++    n_after = sum(p.numel() for p in model.parameters())
++    print(f'  参数量: {n_before:,} -> {n_after:,}  (+{n_after - n_before:,})')
++
++    # 文本模块的参数确实进入了 model.parameters()（优化器才会更新它）
++    text_ids = {id(p) for p in model.text_prior.parameters()}
++    model_ids = {id(p) for p in model.parameters()}
++    assert text_ids.issubset(model_ids), 'text_prior 参数未包含在 model.parameters() 中'
++    print('  text_prior 参数已被 model.parameters() 覆盖  OK')
++
++    # 前向：hook 能拿到 64ch bottleneck 并返回同形状特征
++    model.eval()
++    with torch.no_grad():
++        out = model(torch.randn(1, 3, 256, 256))
++    print(f'  前向输出: {tuple(out.shape)}  OK')
++    assert out.shape[0] == 1 and out.shape[1] == 1
++    print(f'  注入层捕捉到的特征图: {tuple(model.text_prior._last_attention.shape)}  OK')
++
++    # 反向：梯度能流到文本模块
++    model.train()
++    out = model(torch.randn(1, 3, 256, 256))
++    loss = out.mean()
++    loss.backward()
++    has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
++                   for p in model.text_prior.parameters())
++    assert has_grad, '梯度未流入文本先验模块'
++    print('  反向传播梯度已到达文本先验模块  OK')
++
++
++def test_clip_embedder(clip_model_or_path='ViT-B/32'):
++    print('\n[Test 3] ClipTextEmbedder ---------------------------------------------')
++    from components.text_prior import ClipTextEmbedder
++    from components.text_prompts import SINGLE_FRAME_IR_PROMPTS
++
++    device = 'cuda' if torch.cuda.is_available() else 'cpu'
++    emb = ClipTextEmbedder(SINGLE_FRAME_IR_PROMPTS, model_name_or_path=clip_model_or_path, device=device)
++    e = emb.get()
++    print(f'  文本嵌入: {tuple(e.shape)}  dtype={e.dtype}  OK')
++    assert e.dim() == 2 and e.size(0) == len(SINGLE_FRAME_IR_PROMPTS) and e.size(1) == 512
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--with_clip', action='store_true',
++                        help='是否测试 CLIP 文本嵌入（需要 clip 包与权重）')
++    parser.add_argument('--clip_path', default='ViT-B/32',
++                        help="CLIP 模型名（如 ViT-B/32，自动下载）或本地 .pt 绝对路径，"
++                             "例如 /mnt/xxx/ViT-B-32.pt")
++    args = parser.parse_args()
++
++    print('已在 MODEL_TEXT_PRIOR_CFG 中配置的模型:', list(MODEL_TEXT_PRIOR_CFG.keys()))
++
++    test_attention_module()
++    test_msda_integration()
++    if args.with_clip:
++        test_clip_embedder(args.clip_path)
++
++    print('\n全部测试通过 ✓')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/TEXT_PRIOR_README.md b/TEXT_PRIOR_README.md
+new file mode 100644
+--- /dev/null
++++ b/TEXT_PRIOR_README.md
+@@ -0,0 +1,174 @@
++# PAL + TATE：文本先验特征增强（快速验证版）
++
++本目录 = 原版 PAL 的一份副本，**唯一的新增**是：把 SeViL 的文本先验（TATE）以
++**零侵入 forward hook** 的方式注入到 **MSDA** 的 bottleneck，用来观察文本知识对模型的增益。
++
++原版 PAL 逻辑完全保留（`USE_TEXT_PRIOR = False` 即等价于 baseline）。
++
++---
++
++## 1. 本版本改了什么
++
++| 文件 | 状态 | 说明 |
++|---|---|---|
++| `components/text_prompts.py` | **新增** | 单帧红外 prompt 列表（由 SeViL 的 13 条裁剪为 10 条，删除多帧/运动相关条目） |
++| `components/text_prior.py` | **新增** | `ClipTextEmbedder` + `TextPriorAttention`(TATE) + `attach_text_prior()` |
++| `train_model.py` | **改动** | 顶部加 7 个开关；模型构造后接入文本先验 |
++| `test_model.py` | **改动** | 同样接入文本先验（否则测试时特征增强缺失，结果不可比）；`load_state_dict` 改为 `strict=False` 并给出不匹配提示 |
++| 其他所有文件 | 未动 | 与原版一致 |
++
++> ⚠️ **测试必须与训练一致**：TATE 训练的 checkpoint 含 `text_prior.*` 参数，
++> 且前向依赖文本增强。`test_model.py` 已相应修改，并新增 `USE_TEXT_PRIOR` 开关。
++> 若要测 baseline（未接文本先验）的 checkpoint，把 `USE_TEXT_PRIOR = False`。
++
++> ⚠️ **伪标签池必须隔离**：池目录（`dataset/<数据集>/<MODEL_NAME>/`）在训练中会被
++> **原地修改**（choose/mask 被覆盖、no_choose 被搬空）。跑 baseline 与 TATE 对照时，
++> 两者必须从**同一份初始池**出发（删掉重生成，或改 `MODEL_NAME` 后缀隔离），
++> 否则结论无效。
++
++### 注入位置
++
++```
++MSDA_No_Sigmoid
++ └── stage (Stage)
++      └── layer5_4  ←── forward hook 注入 TextPriorAttention（64 通道 bottleneck）
++```
++
++### 关键设计
++
++1. **文本侧可训练**：`f_mlp` / `similarity_mlp` / `reweight` 都可训练；CLIP 冻结且只用于
++   把 prompt 编码一次（初始化时缓存为 buffer，训练零额外开销）。
++2. **残差门控** `alpha`（初值 0）：训练初期模块等价恒等映射，不会破坏 baseline 收敛，
++   由网络自己决定要不要用文本先验。
++3. **随机文本消融开关**：`TEXT_PRIOR_RANDOM=True` 用同形状随机向量，参数量完全一致，
++   用来区分「文本真的携带信息」还是「只是多了一个模块」。
++
++---
++
++## 2. 安装依赖
++
++本模块用 **openai-clip**（和 SeViL 一致）：
++
++```bash
++pip install ftfy regex
++pip install git+https://github.com/openai/CLIP.git
++```
++
++> 如果不想用 git 安装，也可以直接把 SeViL 自带的 CLIP 代码加入 `PYTHONPATH`：
++> ```bash
++> pip install ftfy regex
++> pip install -e /workspace/SeViL/CLIP
++> ```
++
++---
++
++## 3. 下载 CLIP 权重（ViT-B/32）
++
++### 方式 A：自动下载（推荐）
++
++`clip.load('ViT-B/32')` 会自动下载权重并缓存到 `~/.cache/clip/ViT-B-32.pt`。
++装好 `clip` 包后直接跑训练即可，首次运行联网下载一次（约 350MB）。
++
++> **先检查是否已经下过**（如果你在宿主机跑过 SeViL，很可能已经有了）：
++> ```bash
++> ls -lh ~/.cache/clip/
++> ```
++> 若已有 `ViT-B-32.pt`，则完全不需要再下载。
++
++### 方式 B：手动下载 .pt 权重（离线/网络不稳时）
++
++```bash
++mkdir -p ~/.cache/clip
++wget -O ~/.cache/clip/ViT-B-32.pt \
++  https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af/ViT-B-32.pt
++```
++
++下载后有两种用法（二选一）：
++
++- 放到默认缓存目录 `~/.cache/clip/ViT-B-32.pt`，然后照常用 `clip.load('ViT-B/32')`；
++- 或把 `train_model.py` 里的 `TEXT_CLIP_MODEL` 改成绝对路径：
++  ```python
++  TEXT_CLIP_MODEL = '/your/path/to/ViT-B-32.pt'
++  ```
++
++> 注意：即使加载本地 `.pt` 文件，仍然需要安装 `clip` 这个 Python 包来提供模型定义代码。
++
++### 校验是否可用
++
++```bash
++python tools/test_text_prior.py --with_clip
++```
++
++如果权重不在默认缓存目录，直接指定绝对路径：
++
++```bash
++python tools/test_text_prior.py --with_clip --clip_path /your/path/ViT-B-32.pt
++```
++
++---
++
++## 4.5 已修复的原版 MSDA bug（与文本先验无关）
++
++`model/MSDA/MSDA_no_sigmoid.py` 的 4 个 DWT 自定义反向函数里，原来有 5 处：
++
++```python
++filters = filters.repeat(C, 1, 1, 1).to(dtype=torch.float16)   # 硬编码 fp16
++```
++
++这导致**只要不是 AMP autocast 下的 fp16 反向**（例如 fp32 训练、或本自检脚本的
++`loss.backward()`），就会报：
++
++```
++RuntimeError: expected scalar type Float but found Half
++```
++
++已改为跟随梯度 dtype，二者在 AMP 下完全等价，同时 fp32 也能跑：
++
++```python
++filters = filters.repeat(C, 1, 1, 1).to(dtype=dx.dtype)
++```
++
++> 注意：这是**原 PAL 就存在的潜在 bug**，只是原版一直用 `torch.cuda.amp.autocast()`
++> 训练所以没暴露。本修改对 AMP 训练是行为等价的，不影响 baseline 对比。
++
++---
++
++## 4. 运行
++
++```bash
++cd /workspace/PAL+TATE/PAL-main
++python train_model.py
++```
++
++需要保证 `/workspace/SeViL/` 的阅读笔记里提到的那些原版 PAL 注意事项（工作目录、数据集、
++`epoch=100` 硬编码等）一致；本副本没有修这些原版问题。
++
++---
++
++## 5. 实验矩阵（建议）
++
++| 实验 | 配置 | 目的 |
++|---|---|---|
++| baseline | `USE_TEXT_PRIOR = False` | 原版 PAL |
++| +TATE | `USE_TEXT_PRIOR = True`, `TEXT_PRIOR_RANDOM = False` | 真实文本先验 |
++| +TATE(random text) | `USE_TEXT_PRIOR = True`, `TEXT_PRIOR_RANDOM = True` | 消融：文本是否真有信息 |
++| +TATE(no gate) | `TEXT_PRIOR_USE_GATE = False` | 消融：门控的作用 |
++
++对比指标用 PAL 原有的 **IoU / nIoU / Pd / Fa**（`val_fn` 输出）。
++
++> ⚠️ PAL 的主动学习池演化本身有随机性，**务必固定 seed、数据集、epoch 数**再比较，
++> 且建议至少跑 2 个 seed 取均值，否则容易把波动误判为增益。
++
++---
++
++## 6. 调试
++
++- 打印文本注意力图（看模型学到了哪些区域）：
++  ```python
++  attn = model.text_prior._last_attention   # [B,1,H,W]，每次 forward 后更新
++  ```
++- 打印可训练参数是否包含文本模块：
++  ```python
++  print(sum(p.numel() for p in model.text_prior.parameters()))
++  ```
++- 如果提示 `未找到 clip 包` / `模型 XX 尚未配置注入层`，按报错信息处理即可。
