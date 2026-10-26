@@ -46,9 +46,10 @@ def get_loaders(
         mode='val',
     )
 
+    # 验证集保持原图尺寸（只 pad 到 32 的倍数），不同图尺寸不同，因此 batch=1。
     val_loader = DataLoader(
         val_ds,
-        batch_size=test_batch_size,
+        batch_size=1,
         num_workers=num_workers,
         pin_memory=pin_memory,
         shuffle=False,

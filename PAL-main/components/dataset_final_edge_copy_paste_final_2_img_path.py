@@ -13,6 +13,35 @@ import random
 import math
 
 
+_LEGACY_MASK_WARNED = False
+
+
+def pad_to_multiple(image, mask=None, multiple=32):
+    """只做右/下 padding，不做 resize；返回 padding 后的 image/mask 与原图 h,w。"""
+    h, w = image.shape[:2]
+    pad_h = (-h) % multiple
+    pad_w = (-w) % multiple
+    if pad_h or pad_w:
+        image = np.pad(image, ((0, pad_h), (0, pad_w), (0, 0)), mode="constant")
+        if mask is not None:
+            mask = np.pad(mask, ((0, pad_h), (0, pad_w)), mode="constant")
+    return image, mask, h, w
+
+
+def match_mask_to_image(mask, image):
+    """新伪标签应始终与原图同尺寸；这里只兼容旧版 256×256 伪标签。"""
+    global _LEGACY_MASK_WARNED
+    if mask.shape[:2] == image.shape[:2]:
+        return mask
+    if mask.shape[:2] == (256, 256):
+        if not _LEGACY_MASK_WARNED:
+            print("[warn] 检测到旧版 256×256 伪标签，正在临时对齐到原图；"
+                  "建议删除旧伪标签目录后重新生成，才能获得原图坐标的标签。")
+            _LEGACY_MASK_WARNED = True
+        return cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+    raise ValueError(f"mask 与原图尺寸不一致且不是旧版 256×256：image={image.shape[:2]}, mask={mask.shape[:2]}")
+
+
 
 def random_crop(img, mask, patch_size):
     h, w, c = img.shape
@@ -55,10 +84,8 @@ class SirstDataset(Dataset):
         mask = np.array(Image.open(mask_path).convert("L"), dtype=np.float32)  
         mask = (mask > 127.5).astype(float)
 
-        # 关键修复：自更新写回的 mask 被 resize 成 256×256，而原图尺寸可能不同。
-        # 统一把 mask 对齐到原图尺寸，避免 random_crop / albumentations 的形状断言失败。
-        if image.shape[:2] != mask.shape[:2]:
-            mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+        # 新流程的伪标签始终与原图同尺寸；这里只兼容旧版 256×256 伪标签。
+        mask = match_mask_to_image(mask, image)
 
         if (self.mode == 'train'):
             # 恢复原始 PAL 的随机裁剪：输出固定 patch_size(256×256) 的 patch，batch_size>1 才能正常拼接。
@@ -80,15 +107,11 @@ class SirstDataset(Dataset):
             return image, mask, edge
 
         elif (self.mode == 'val'):
-            # times = 32
-            # h, w, c = image.shape
-            # pad_height = math.ceil(h / times) * times - h
-            # pad_width = math.ceil(w / times) * times - w
-            # image = np.pad(image, ((0, pad_height), (0, pad_width), (0, 0)), mode='constant')
-            # mask = np.pad(mask, ((0, pad_height), (0, pad_width)), mode='constant')
+            # 只 pad 到 32 的倍数，不 resize；返回原图 h,w，供评估时裁回原坐标。
+            image, mask, h, w = pad_to_multiple(image, mask, multiple=32)
             if self.transform is not None:
                 augmentations = self.transform(image=image, mask=mask)
                 image = augmentations["image"]
                 mask = augmentations["mask"]
 
-            return image, mask
+            return image, mask, h, w

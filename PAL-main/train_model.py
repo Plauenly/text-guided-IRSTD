@@ -14,6 +14,7 @@ from albumentations.pytorch import ToTensorV2
 
 # 项目自定义的模块
 from components.utils_all_edge_copy_paste_final_2_img_path import get_loaders, make_dir
+from components.dataset_final_edge_copy_paste_final_2_img_path import pad_to_multiple, match_mask_to_image
 from components.cal_mean_std import Calculate_mean_std
 from components.metric_new_crop import *
 from loss.Edge_loss import edgeSCE_loss
@@ -188,18 +189,17 @@ class SirstDataset_test(Dataset):
         image = np.array(Image.open(img_path).convert("RGB"))
         mask = np.array(Image.open(mask_path).convert("L"))
         mask = (mask > 127.5).astype(float)
-        # image = cv2.resize(image, (self.image_height, self.image_width))
-        # 同理：先把 mask 对齐到原图尺寸，再交给 test_transforms（其内部会 resize 到 256）
-        if image.shape[:2] != mask.shape[:2]:
-            mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+        # 新伪标签与原图同尺寸；只兼容旧版 256×256 标签。
+        mask = match_mask_to_image(mask, image)
 
         if (self.mode == 'test'):
-            # image = PadImg(image, times=32)
+            # 只 pad 到 32 的倍数，不 resize；返回原图 h,w 用于把预测裁回原坐标。
+            image, _, h, w = pad_to_multiple(image, mask=None, multiple=32)
             if self.transform is not None:
                 augmentations = self.transform(image=image, mask=mask)
                 image = augmentations["image"]
                 mask = augmentations["mask"]
-            return image, mask, self.image_list[index]
+            return image, mask, self.image_list[index], h, w
 
         else:
             print("mode输入的格式不对")
@@ -308,20 +308,15 @@ def main():
         FA_PD_metric.reset()
         eval_losses = []
         with torch.no_grad():
-            for batch_idx, (x, y) in enumerate(loop):
+            for batch_idx, (x, y, h, w) in enumerate(loop):
                 x = x.to(device=DEVICE)
                 y = y.unsqueeze(1).to(device=DEVICE)
-                # print(y.shape)
+                h_i = int(h[0])
+                w_i = int(w[0])
                 preds_no_sigmoid = test_pred(x, model)
-                
-                # 注意：以下三行代码有问题。
-                # 1.为什么只使用第0个batch?  因为源代码的该数据集的batch_size设置为1,使用第一个也是以防万一，因为模型不同输出的尺寸也不一致
-                # 2.eval_losses根本没有被计算！ 
-                # preds_no_sigmoid = preds_no_sigmoid[0, :, :h, :w]
-                # y = y[0, :, :h, :w]
-                # eval_losses = 0
-                preds_no_sigmoid = F.interpolate(preds_no_sigmoid,(IMAGE_SIZE,IMAGE_SIZE), mode="bilinear", align_corners=False)
-                # y = y[:, :, :h, :w]
+                # 预测和 GT 都裁回原图坐标；不做 resize/interpolate。
+                preds_no_sigmoid = preds_no_sigmoid[:, :, :h_i, :w_i]
+                y = y[:, :, :h_i, :w_i]
                 preds = torch.sigmoid(preds_no_sigmoid)
                 # 原代码 `eval_losses = loss_fn(preds, y, None)` 有两个问题：
                 #   1) 此处 preds 尚未定义 -> NameError；2) edgeSCE_loss 需要 edge，传 None 会报错。
@@ -363,26 +358,9 @@ def main():
             ToTensorV2(),
         ],
     )
+    # 评估/伪标签更新只做 Normalize；几何上只 pad 到 32 的倍数，之后裁回原图。
     val_transforms = A.Compose(
         [
-            # 按照原图像的最长边按比例缩放到256，最短边也按等比例缩放到x，如果不够256用0补齐到256，补齐方向是下或左（即不影响坐标的比例对应）
-            A.LongestMaxSize(max_size=IMAGE_SIZE),
-            A.PadIfNeeded(IMAGE_SIZE,IMAGE_SIZE,border_mode = 0, value = 0, position=A.PadIfNeeded.PositionType.TOP_LEFT),
-            A.Resize(height=IMAGE_SIZE, width=IMAGE_SIZE),
-            A.Normalize(
-                mean=cal_mean,
-                std=cal_std,
-                max_pixel_value=255.0,
-            ),
-            ToTensorV2(),
-        ],
-    )
-
-    test_transforms = A.Compose(
-        [
-            A.LongestMaxSize(max_size=IMAGE_SIZE),
-            A.PadIfNeeded(IMAGE_SIZE,IMAGE_SIZE,border_mode = 0, value = 0, position=A.PadIfNeeded.PositionType.TOP_LEFT),
-            A.Resize(height=IMAGE_SIZE, width=IMAGE_SIZE),
             A.Normalize(
                 mean=cal_mean,
                 std=cal_std,
@@ -548,13 +526,14 @@ def main():
                 image_dir=TRAIN_IMG_DIR,
                 mask_dir= TRAIN_MASK_DIR,
                 img_name_list=os.listdir(TRAIN_IMG_DIR),
-                transform=test_transforms,
+                transform=val_transforms,
                 mode='test'
             )
 
+            # 更新阶段保持原图尺寸，尺寸不一，只能 batch=1。
             train_loader_label_update = DataLoader(
                 train_ds,
-                batch_size=TEST_BATCH_SIZE,
+                batch_size=1,
                 num_workers=NUM_WORKERS,
                 pin_memory=PIN_MEMORY,
                 shuffle=False,
@@ -565,13 +544,14 @@ def main():
                 # mask_dir= nc_mask_dir,
                 mask_dir = nc_points_dir,
                 img_name_list=os.listdir(nc_img_dir),
-                transform=test_transforms,
+                transform=val_transforms,
                 mode='test'
             )
 
+            # 困难样本预测同样保持原图尺寸，batch=1。
             test_loader = DataLoader(
                 test_ds,
-                batch_size=TEST_BATCH_SIZE,
+                batch_size=1,
                 num_workers=NUM_WORKERS,
                 pin_memory=PIN_MEMORY,
                 shuffle=False,
@@ -589,51 +569,36 @@ def main():
                     
                     print("开始标签的自更新--------")
                     # data的来源是choose文件夹（容易样本）
-                    for idx, (img, masks, name) in tqdm(enumerate(train_loader_label_update)):
+                    for idx, (img, masks, name, h, w) in tqdm(enumerate(train_loader_label_update)):
                         img = img.to(device=DEVICE)
                         with torch.no_grad():
                             output = test_pred(img, model)  #type(output) = torch.Tensor
-                            # output = output[:, :, :h, :w]
                             output = torch.sigmoid(output)
                             output = output.cpu().data.numpy()
                         # 对每一个掩码都做一次自更新,
                         for i in range(output.shape[0]):
-                            pred = output[i]
-                            pred = pred[0]
-                            pred = np.array(pred, dtype='float32')
-
-                            pred = cv2.resize(pred, (IMAGE_SIZE, IMAGE_SIZE))
-                            # mask_label_in_path = os.path.join(TRAIN_MASK_DIR, name[i])
-                            # prev_label = cv2.imread(mask_label_in_path, cv2.IMREAD_GRAYSCALE) / 255
+                            h_i, w_i = int(h[i]), int(w[i])
+                            pred = np.array(output[i, 0, :h_i, :w_i], dtype='float32')
                             prev_label = masks[i].cpu().data.numpy()
-                            # 自更新函数
-                            current_binary_pred = update_gt_update_degen_corr(pred, prev_label, thresh_Tb, thresh_k, [IMAGE_SIZE,IMAGE_SIZE], degen=degen)
+                            # 自更新函数；pred/mask 都在原图坐标，不 resize。
+                            current_binary_pred = update_gt_update_degen_corr(
+                                pred, prev_label, thresh_Tb, thresh_k, [h_i, w_i], degen=degen)
                             current_binary_pred = current_binary_pred * 255
-                            cv2.imwrite(os.path.join(TRAIN_MASK_DIR, name[i]), current_binary_pred)     # 覆盖掉原来choose里的掩码
+                            cv2.imwrite(os.path.join(TRAIN_MASK_DIR, name[i]), current_binary_pred)
 
                     print("开始认识并学习困难样本-----------")
                      # test_loader用的是no_choose数据集，即困难样本  
-                    for idx, (img, _, name) in tqdm(enumerate(test_loader)):
+                    for idx, (img, _, name, h, w) in tqdm(enumerate(test_loader)):
                         img = img.to(device=DEVICE)
                         with torch.no_grad():
                             output = test_pred(img, model)
-                            # output = output[:, :, :h, :w]
                             output = torch.sigmoid(output)
                             output = output.cpu().data.numpy()
 
                         for i in range(output.shape[0]):
-                            pred = output[i]
-                            pred = pred[0]
-                            pred = np.array(pred, dtype='float32')
-                            pred = cv2.resize(pred, (IMAGE_SIZE, IMAGE_SIZE))
-                            # 关键：把预测掩码缩回点标注(原图)的尺寸，保证与 nc_points 空间对齐，
-                            # 否则后续 nc_correct_pred_mask 中 256×256 与 245×245 相加会广播报错。
-                            point_mask_path = os.path.join(nc_points_dir, name[i])
-                            point_mask = cv2.imread(point_mask_path, cv2.IMREAD_GRAYSCALE)
-                            if point_mask is not None and point_mask.shape != pred.shape:
-                                pred = cv2.resize(pred, (point_mask.shape[1], point_mask.shape[0]),
-                                                  interpolation=cv2.INTER_LINEAR)
-                            # 满足条件(pred>0.5)的坐标下的像素值赋为255，否则赋为0
+                            h_i, w_i = int(h[i]), int(w[i])
+                            pred = np.array(output[i, 0, :h_i, :w_i], dtype='float32')
+                            # 原图坐标下二值化，不 resize。
                             pred = np.where(pred > 0.5, 255, 0).astype(np.uint8)
                             cv2.imwrite(os.path.join(nc_mask_dir, name[i]), pred)
 
@@ -667,25 +632,20 @@ def main():
                 if epoch % clear_epoch_gap != 0:
                     pass
                 else:
-                    for idx, (img, masks, name) in tqdm(enumerate(train_loader_label_update)):
+                    for idx, (img, masks, name, h, w) in tqdm(enumerate(train_loader_label_update)):
                         img = img.to(device=DEVICE)
                         with torch.no_grad():
                             output = test_pred(img, model)
-                            # output = output[:, :, :h, :w]
                             output = torch.sigmoid(output)
                             output = output.cpu().data.numpy()
 
                         for i in range(output.shape[0]):
-                            pred = output[i]
-                            pred = pred[0]
-                            pred = np.array(pred, dtype='float32')
-
-                            pred = cv2.resize(pred, (IMAGE_SIZE, IMAGE_SIZE))
-                            # mask_label_in_path = os.path.join(TRAIN_MASK_DIR, name[i])
-                            # prev_label = cv2.imread(mask_label_in_path, cv2.IMREAD_GRAYSCALE) / 255
+                            h_i, w_i = int(h[i]), int(w[i])
+                            pred = np.array(output[i, 0, :h_i, :w_i], dtype='float32')
                             prev_label = masks[i].cpu().data.numpy()
-                            # 自更新
-                            current_binary_pred = update_gt_update_degen_corr(pred, prev_label, thresh_Tb, thresh_k, [IMAGE_SIZE,IMAGE_SIZE], degen=degen)
+                            # 自更新；pred/mask 都在原图坐标，不 resize。
+                            current_binary_pred = update_gt_update_degen_corr(
+                                pred, prev_label, thresh_Tb, thresh_k, [h_i, w_i], degen=degen)
                             current_binary_pred = current_binary_pred * 255
                             cv2.imwrite(os.path.join(TRAIN_MASK_DIR, name[i]), current_binary_pred)
             else:
