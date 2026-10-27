@@ -38,10 +38,15 @@ class ClipTextEmbedder:
         model_name_or_path (str): 'ViT-B/32' 之类的模型名（会自动下载），
             或本地权重文件路径（如 '/path/to/ViT-B-32.pt'）。
         device (str): 'cuda' 或 'cpu'。
+        keep_image_tower (bool): 是否保留 CLIP 图像塔。
+            True 时把整个 CLIP 模型保存在 `self.clip_model` 里不释放，供
+            CI 门控（components/credibility.py）计算图文相似度复用同一份
+            文本嵌入；关闭时行为与原来完全一致（编码完立即释放）。
         verbose (bool): 是否打印加载信息。
     """
 
-    def __init__(self, prompts, model_name_or_path='ViT-B/32', device='cuda', verbose=True):
+    def __init__(self, prompts, model_name_or_path='ViT-B/32', device='cuda',
+                 keep_image_tower=False, verbose=True):
         try:
             import clip
         except ImportError as e:
@@ -69,19 +74,32 @@ class ClipTextEmbedder:
         with torch.no_grad():
             text_features = clip_model.encode_text(tokens)   # [N, 512]，CLIP 默认 fp16
 
-        # 统一转 fp32 保存；CLIP 之后不再需要，释放显存
+        # 统一转 fp32 保存
         self.text_features = text_features.detach().float().cpu()
-        del clip_model
-        if device.startswith('cuda'):
-            torch.cuda.empty_cache()
 
-        if verbose:
-            print(f'[TextPrior] 文本嵌入已缓存: shape={tuple(self.text_features.shape)}，'
-                  f'CLIP 已释放。')
+        if keep_image_tower:
+            # CI 门控需要图像塔：保留模型（已在 eval + requires_grad=False）
+            self.clip_model = clip_model
+            if verbose:
+                print(f'[TextPrior] 文本嵌入已缓存: shape={tuple(self.text_features.shape)}，'
+                      f'CLIP 图像塔保留（供 CI 门控复用）。')
+        else:
+            # 原行为：CLIP 之后不再需要，立即释放显存
+            self.clip_model = None
+            del clip_model
+            if device.startswith('cuda'):
+                torch.cuda.empty_cache()
+            if verbose:
+                print(f'[TextPrior] 文本嵌入已缓存: shape={tuple(self.text_features.shape)}，'
+                      f'CLIP 已释放。')
 
     def get(self):
         """返回缓存的文本嵌入 [N, 512]（CPU, float32）。"""
         return self.text_features
+
+    def get_image_tower(self):
+        """返回保留的 CLIP 模型（含 encode_image）；未保留时返回 None。"""
+        return getattr(self, 'clip_model', None)
 
 
 # =============================================================================

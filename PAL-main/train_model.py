@@ -5,6 +5,7 @@ from datetime import datetime
 import torch
 import os
 import sys
+import json
 import numpy as np
 
 # 第三方图像增强库albumentations，适用于cv2的使用场景(cpu上)，它有一个好处是image与bbox-mask, point-mask进行的缩放操作是同等（不需要考虑坐标转换）
@@ -21,6 +22,9 @@ from loss.Edge_loss import edgeSCE_loss
 from utilts import *
 from components.text_prior import ClipTextEmbedder, attach_text_prior
 from components.text_prompts import SINGLE_FRAME_IR_PROMPTS
+from components.credibility import (CIPatchScorer, extract_components, sample_mean_ci,
+                                    spurious_ratio, gmm_threshold, fallback_threshold,
+                                    admit_ratio)
 
 import cv2
 from torch.utils.data import Dataset
@@ -80,6 +84,25 @@ TEXT_CLIP_MODEL = 'ViT-B/32'   # 或本地权重路径，如 '/path/to/ViT-B-32.
 TEXT_PRIOR_HIDDEN = 256        # f_mlp 隐层维度
 TEXT_PRIOR_USE_GATE = True     # 残差门控 alpha，保证初期不破坏 baseline
 TEXT_PRIOR_GATE_INIT = 0.0     # alpha 初值，0 = 初始等价恒等映射
+## =================================================================
+
+## ============ CI 门控（TAPF 风格困难样本筛选）相关参数 ============
+## 用 SeViL 的 CI = 2SK/(S+K) + GMM 动态阈值，替换 PAL 原有的
+## "点位漏检率 / 虚警比" 人工判据（utilts.nc_pred_mask + deal_pred_mask_and_true_point_in）。
+## 规则：对每张困难样本算 图级均值 CI（未匹配点记 0）→ 对全体困难样本的均值
+##       拟合 2 分量 GMM 取高簇密度峰值作为 theta → mean_ci >= theta 才进简单池。
+## 默认启用；置 False 可完全回到原版 PAL 门控（仅用于 A/B 对照）。
+## 完整改动记录见 PAL+TATE/CI_FILTER_CHANGELOG.md
+USE_CI_FILTER = True
+CI_EMA_BETA = 0.5          # 阈值跨轮 EMA 平滑系数（越大越平滑，防抖动）
+CI_MIN_POOL = 4            # 参与 GMM 的样本数少于此值时改用回退阈值
+CI_FALLBACK = 'median'     # 回退阈值口径：'median'（池中位数）或 'fixed'（0.3）
+## 数量闸：theta 只管"谁比谁好"，k 管"这轮最多放几个"（单峰分布时也能节流）
+CI_USE_QUOTA = True        # False -> 只靠 theta（此时容易恢复"一次进太多"）
+CI_ADMIT_RATIO_INIT = 0.05 # 每轮最多放行比例（占困难池）的起点，线性升到 1.0
+CI_CROP_SIDE_RATIO = 1.5   # CLIP 局部窗边长 = 系数 × 过点组件 bbox 长边
+CI_CROP_MIN = 16           # 局部窗边长下限（像素）：红外目标只有几个像素
+CI_CROP_MAX = 64           # 局部窗边长上限（像素）
 ## =================================================================
 
 ## 根据给定的choose_model, choose_dataset, choose_dataset_type生成对应文件夹作为工作空间,且加一个时间码确保文件夹的独一无二性,不存在覆盖问题 
@@ -375,14 +398,20 @@ def main():
     else:
         model = model_func().to(DEVICE)
 
-    # ==================== 文本先验(TATE)接入 ====================
+    # ==================== 文本先验(TATE) + CI 门控接入 ====================
     # 说明：必须在 optimizer 之前接入，且以 model.add_module 注册，
     #      这样下面 AdamW(model.parameters()) 才能自动包含文本模块的参数。
-    if USE_TEXT_PRIOR:
+    # CI 门控与 TATE 共用同一份 CLIP 文本嵌入 E（若 TEXT_PRIOR_RANDOM=True，
+    # 门控也使用随机文本，这正是“文本到底有没有信息量”消融所需的语义）。
+    _embedder = None
+    ci_scorer = None
+    if USE_TEXT_PRIOR or USE_CI_FILTER:
         _embedder = ClipTextEmbedder(
             SINGLE_FRAME_IR_PROMPTS,
             model_name_or_path=TEXT_CLIP_MODEL,
             device=DEVICE,
+            # CI 门控需要 CLIP 图像塔；只做 TATE 时保持原行为（编码完即释放）
+            keep_image_tower=USE_CI_FILTER,
         )
         text_embedding = _embedder.get()          # [N, 512]
 
@@ -392,14 +421,27 @@ def main():
             text_embedding = torch.randn(text_embedding.shape, generator=_g)
             print('[TextPrior] **消融模式**：使用随机文本嵌入（random text embedding）')
 
-        attach_text_prior(
-            model,
-            text_embedding,
-            choose_model=choose_model,
-            hidden_dim=TEXT_PRIOR_HIDDEN,
-            use_gate=TEXT_PRIOR_USE_GATE,
-            gate_init=TEXT_PRIOR_GATE_INIT,
-        )
+        if USE_TEXT_PRIOR:
+            attach_text_prior(
+                model,
+                text_embedding,
+                choose_model=choose_model,
+                hidden_dim=TEXT_PRIOR_HIDDEN,
+                use_gate=TEXT_PRIOR_USE_GATE,
+                gate_init=TEXT_PRIOR_GATE_INIT,
+            )
+
+        if USE_CI_FILTER:
+            ci_scorer = CIPatchScorer(
+                _embedder.get_image_tower(),
+                text_embedding,
+                DEVICE,
+                side_ratio=CI_CROP_SIDE_RATIO,
+                min_side=CI_CROP_MIN,
+                max_side=CI_CROP_MAX,
+            )
+            print('[CI-Filter] 已启用 CI 门控：S=概率图组件置信度，K=CLIP 图文余弦相似度，'
+                  'theta=图级均值 CI 的 GMM 高簇峰值（跨轮 EMA 平滑）')
     # =========================================================
 
     loss_fn = edgeSCE_loss
@@ -437,6 +479,13 @@ def main():
     save_stage1_file_name = os.path.join(save_model_file_path,
                                          'stage1_checkpoint_' + MODEL_NAME + ".pth.tar")
 
+    # ---- CI 门控的状态：阈值 EMA 与逐轮日志 ----
+    # theta 的 EMA 需要跨轮保持；落盘是为了 --resume1 / 中断重启后阈值不重置。
+    ci_theta_file = os.path.join(save_model_file_path, 'ci_theta.json')
+    ci_log_dir = os.path.join(save_model_file_path, 'ci_log')
+    ci_theta_ema = None
+    make_dir(ci_log_dir)
+
     # 命令行参数：python train_model.py --resume1
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume1', action='store_true',
@@ -464,6 +513,15 @@ def main():
         bestmIoUandPD = checkpoint.get('bestmIoUandPD', 0)
         print(f"[resume1] 已加载第一阶段权重：{save_stage1_file_name}，从 epoch={start_epoch} 开始训练")
         save_file.write(f"[resume1] 加载第一阶段权重，从 epoch={start_epoch + 1} 开始训练。\n")
+        # 续训时恢复 CI 阈值 EMA，避免阈值从零重建造成第一轮放行数突变
+        if USE_CI_FILTER and os.path.exists(ci_theta_file):
+            try:
+                with open(ci_theta_file, 'r') as f:
+                    ci_theta_ema = float(json.load(f).get('theta_ema'))
+                print(f"[CI-Filter] 恢复阈值 EMA：theta_ema={ci_theta_ema:.5f}")
+                save_file.write(f"[CI-Filter] 恢复阈值 EMA：theta_ema={ci_theta_ema:.5f}\n")
+            except Exception as e:
+                print(f"[CI-Filter] 阈值 EMA 恢复失败（忽略）：{e}")
         save_file.flush()
     else:
         start_epoch = 0
@@ -588,26 +646,174 @@ def main():
 
                     print("开始认识并学习困难样本-----------")
                      # test_loader用的是no_choose数据集，即困难样本  
-                    for idx, (img, _, name, h, w) in tqdm(enumerate(test_loader)):
-                        img = img.to(device=DEVICE)
-                        with torch.no_grad():
-                            output = test_pred(img, model)
-                            output = torch.sigmoid(output)
-                            output = output.cpu().data.numpy()
+                    if USE_CI_FILTER:
+                        # ==================== CI 门控（TAPF 风格） ====================
+                        # 替换 PAL 原判据：不再用"点位漏检率 + 虚警比"人工阈值，而是对每张
+                        # 困难样本算 图级均值 CI（= 各点对应过点组件 CI 的均值，未匹配点记 0），
+                        # 再对全体均值拟合 GMM(2)、取高簇密度峰值作为 theta；
+                        # mean_ci >= theta 才进简单池。公式与推导见 components/credibility.py 头部。
+                        # 注意：均值天然包含"漏点惩罚"，因此不再需要 lose_point_ratio 爬坡。
+                        ci_records = []     # 通过虚警预筛、参与 GMM 的样本
+                        ci_skipped = 0      # 被虚警预筛挡下的样本数（留在困难池）
+                        auto_in = []        # 无点标注的样本：沿用原逻辑直接进简单池
 
-                        for i in range(output.shape[0]):
-                            h_i, w_i = int(h[i]), int(w[i])
-                            pred = np.array(output[i, 0, :h_i, :w_i], dtype='float32')
-                            # 原图坐标下二值化，不 resize。
-                            pred = np.where(pred > 0.5, 255, 0).astype(np.uint8)
-                            cv2.imwrite(os.path.join(nc_mask_dir, name[i]), pred)
+                        for idx, (img, _, name, h, w) in tqdm(enumerate(test_loader)):
+                            img = img.to(device=DEVICE)
+                            with torch.no_grad():
+                                output = test_pred(img, model)
+                                output = torch.sigmoid(output)
+                                output = output.cpu().data.numpy()
 
-                    # deal_pred_mask_and_true_point_in 函数找到哪些困难样本可以被模型识别出来了并放在new_choose_list
-                    new_choose_list = deal_pred_mask_and_true_point_in(nc_img_dir, nc_mask_dir,
-                                                                       nc_points_dir, TRAIN_IMG_DIR,
-                                                                       TRAIN_MASK_DIR, train_points_dir,
-                                                                       lose_point_ratio=lose_point_ratio,
-                                                                       alarm_point_ration=alarm_point_ration)
+                            for i in range(output.shape[0]):
+                                h_i, w_i = int(h[i]), int(w[i])
+                                name_i = name[i]
+                                # 原图坐标下的概率图，不 resize（S 与二值化都用它）
+                                prob = np.array(output[i, 0, :h_i, :w_i], dtype='float32')
+                                # CI 需要对原始灰度像素做 CLIP 裁剪，直接读盘（与原流程一致，无归一化污染）
+                                gray = cv2.imread(os.path.join(nc_img_dir, name_i), cv2.IMREAD_GRAYSCALE)
+                                points = cv2.imread(os.path.join(nc_points_dir, name_i), cv2.IMREAD_GRAYSCALE)
+                                if gray is None or points is None:
+                                    print(f"图像或点标注读取失败：{name_i}")
+                                    continue
+
+                                # 阶段 A：连通域 + 过点标记（纯几何，不消耗 CLIP）
+                                comp = extract_components(prob, points, prob_thr=0.5)
+                                if comp['n_points'] == 0:
+                                    # 与原版一致：没有点标注的困难样本视为容易样本
+                                    auto_in.append((name_i, comp['bin_mask']))
+                                    continue
+                                # 虚警预筛：不过点组件过多 -> 本轮不学，留在困难池
+                                # 分母固定为点数，语义比原版 "除以预测组件数" 更稳
+                                if spurious_ratio(comp['n_spurious'], comp['n_points']) > alarm_point_ration:
+                                    ci_skipped += 1
+                                    continue
+
+                                # 阶段 B：过点组件的 CI（只有这一步用 CLIP 图像塔）
+                                ci = sample_mean_ci(comp, gray, prob, ci_scorer)
+                                ci_records.append(dict(
+                                    name=name_i, mean_ci=ci['mean_ci'],
+                                    ci_per_point=ci['ci_per_point'],
+                                    S=ci['S'], K=ci['K'],
+                                    n_points=comp['n_points'],
+                                    n_spurious=comp['n_spurious'],
+                                    bin_mask=comp['bin_mask'],
+                                ))
+
+                        # 阶段 C：GMM 动态阈值（统计单元 = 图级均值 CI），跨轮 EMA 平滑
+                        pool = [r['mean_ci'] for r in ci_records]
+                        theta_gmm = gmm_threshold(pool, min_samples=CI_MIN_POOL)
+                        if theta_gmm is None:
+                            # 样本太少无法稳定拟合 2 分量：回退池中位数（约放行一半）
+                            theta_gmm = fallback_threshold(pool, CI_FALLBACK)
+                        if theta_gmm > 0.0:
+                            if ci_theta_ema is None:
+                                ci_theta_ema = theta_gmm
+                            else:
+                                ci_theta_ema = CI_EMA_BETA * ci_theta_ema + (1.0 - CI_EMA_BETA) * theta_gmm
+                            theta = ci_theta_ema
+                        else:
+                            # 全部 mean_ci 都为 0（所有点都没被检出）：本轮不放行。
+                            # 不能把这个 0 写进 EMA，否则后续阈值会被永久拉成 0。
+                            theta = float('inf')
+
+                        # 阶段 D：放行（theta 决定"够不够格"，k 决定"这轮最多进几个"）
+                        passed = [r for r in ci_records if r['mean_ci'] >= theta]
+                        if CI_USE_QUOTA:
+                            # 数量闸：k = 放行比例 × 当前困难池总数；比例随阶段从
+                            # CI_ADMIT_RATIO_INIT 升到 1.0（斜率同 PAL 的 lose_point_ratio）。
+                            # 池子数在搬文件之前取，才是本轮真实的基数。
+                            n_pool = len(os.listdir(nc_img_dir))
+                            ratio = admit_ratio(epoch, NUM_EPOCHS, CI_ADMIT_RATIO_INIT,
+                                                clear_inital_ratio, final_epoch_ratio)
+                            k = max(1, int(round(ratio * n_pool)))
+                            # 超过 k 的部分按 mean_ci 从高到低取，差额留在困难池下一轮再判
+                            passed.sort(key=lambda x: x['mean_ci'], reverse=True)
+                            accepted = passed[:k]
+                            quota_cut = len(passed) - len(accepted)
+                        else:
+                            accepted, k, quota_cut, ratio = passed, -1, 0, 1.0
+                        new_choose_list = [r['name'] for r in accepted] + [n for n, _ in auto_in]
+                        # 落盘二值预测：后续 deal_gen_mask_error_aera 会只保留过点连通域
+                        # 并与点标注融合（虚警在精炼时被剔除），文件名与原流程保持一致。
+                        for r in accepted:
+                            cv2.imwrite(os.path.join(nc_mask_dir, r['name']), r['bin_mask'] * 255)
+                        for name_i, bin_mask in auto_in:
+                            cv2.imwrite(os.path.join(nc_mask_dir, name_i), bin_mask * 255)
+
+                        # ---- 日志：阈值 / 放行数 / 分布 / 按点数分组 / 逐样本明细 ----
+                        if len(pool) > 0:
+                            q = np.percentile(np.asarray(pool), [10, 50, 90])
+                            mean_S = float(np.mean([np.mean(r['S']) for r in ci_records if len(r['S'])]))
+                            mean_K = float(np.mean([np.mean(r['K']) for r in ci_records if len(r['K'])]))
+                        else:
+                            q = [0.0, 0.0, 0.0]
+                            mean_S = mean_K = 0.0
+                        ci_msg = (f"[CI-Filter] epoch:{epoch + 1} 候选:{len(ci_records)} "
+                                  f"虚警预筛挡下:{ci_skipped} theta_gmm:{theta_gmm:.5f} "
+                                  f"theta_ema:{ci_theta_ema if ci_theta_ema is not None else -1:.5f} "
+                                  f"本轮theta:{theta:.5f} 过theta:{len(passed)} k:{k} "
+                                  f"被k卡掉:{quota_cut} 放行:{len(accepted)}(+无点{len(auto_in)}) "
+                                  f"放行比例:{ratio:.3f} "
+                                  f"mean_ci p10/p50/p90:{q[0]:.5f}/{q[1]:.5f}/{q[2]:.5f} "
+                                  f"avgS:{mean_S:.4f} avgK:{mean_K:.4f}")
+                        print(ci_msg)
+                        save_file.write(ci_msg + "\n")
+                        # 单点图的 mean_ci 就是单个组件的值（噪声大），多点图被平均过；
+                        # 分开统计才能判断多点图是否被系统性卡住。
+                        for tag, arr in (('单点图', [r['mean_ci'] for r in ci_records if r['n_points'] == 1]),
+                                         ('多点图', [r['mean_ci'] for r in ci_records if r['n_points'] > 1])):
+                            if arr:
+                                acc = sum(1 for v in arr if v >= theta)
+                                save_file.write(f"  {tag}: n={len(arr)} 过theta={acc} "
+                                                f"mean_ci均值={np.mean(arr):.5f}\n")
+                        # 阈值落盘：供 --resume1 / 中断重启后恢复 EMA
+                        try:
+                            with open(ci_theta_file, 'w') as f:
+                                json.dump(dict(epoch=epoch + 1, theta_gmm=theta_gmm,
+                                               theta_ema=ci_theta_ema), f)
+                        except Exception as e:
+                            print(f"[CI-Filter] 阈值落盘失败（忽略）：{e}")
+                        # 逐样本明细：用于事后分析 CI 分布、S/K 量级与放行原因
+                        # admitted 记录"最终是否真的进简单池"（已包含数量闸的裁剪）
+                        accepted_names = {r['name'] for r in accepted}
+                        try:
+                            with open(os.path.join(ci_log_dir, f"ci_round_epoch{epoch + 1:04d}.jsonl"), 'w') as f:
+                                for r in ci_records:
+                                    f.write(json.dumps(dict(
+                                        name=r['name'], mean_ci=r['mean_ci'],
+                                        ci_per_point=r['ci_per_point'], S=r['S'], K=r['K'],
+                                        n_points=r['n_points'], n_spurious=r['n_spurious'],
+                                        pass_theta=bool(r['mean_ci'] >= theta),
+                                        admitted=bool(r['name'] in accepted_names),
+                                    )) + "\n")
+                        except Exception as e:
+                            print(f"[CI-Filter] 明细落盘失败（忽略）：{e}")
+                        save_file.flush()
+                        # ==================== 以上为 CI 门控，以下与原流程一致 ====================
+
+                    else:
+                        # ---------------- 原版 PAL 门控（A/B 对照用，默认不启用） ----------------
+                        for idx, (img, _, name, h, w) in tqdm(enumerate(test_loader)):
+                            img = img.to(device=DEVICE)
+                            with torch.no_grad():
+                                output = test_pred(img, model)
+                                output = torch.sigmoid(output)
+                                output = output.cpu().data.numpy()
+
+                            for i in range(output.shape[0]):
+                                h_i, w_i = int(h[i]), int(w[i])
+                                pred = np.array(output[i, 0, :h_i, :w_i], dtype='float32')
+                                # 原图坐标下二值化，不 resize。
+                                pred = np.where(pred > 0.5, 255, 0).astype(np.uint8)
+                                cv2.imwrite(os.path.join(nc_mask_dir, name[i]), pred)
+
+                        # deal_pred_mask_and_true_point_in 函数找到哪些困难样本可以被模型识别出来了并放在new_choose_list
+                        new_choose_list = deal_pred_mask_and_true_point_in(nc_img_dir, nc_mask_dir,
+                                                                           nc_points_dir, TRAIN_IMG_DIR,
+                                                                           TRAIN_MASK_DIR, train_points_dir,
+                                                                           lose_point_ratio=lose_point_ratio,
+                                                                           alarm_point_ration=alarm_point_ration)
+
                     print(new_choose_list)
                     print(len(new_choose_list))
                     save_file.write(f"当前epoch:{epoch + 1}  进入张数:{len(new_choose_list)} \n")   # 第一次预测都有500多张可以进入，我怀疑模型有与训练权重

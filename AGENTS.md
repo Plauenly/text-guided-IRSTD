@@ -31,6 +31,7 @@ PAL+TATE/                      ← git 仓库根目录
 ├── pal_tate_full.patch        ← 完整补丁（原版 PAL → 本仓库）
 ├── pal_tate_dtype_fix.patch   ← v1 补丁（DWT dtype 修复 + test 脚本 --clip_path）
 ├── pal_tate_step2.patch       ← step2 补丁（test_model 支持文本先验 + AMP dtype 小修）
+├── CI_FILTER_CHANGELOG.md     ★★ CI 门控改动记录（用 CI+GMM 替换 PAL 困难样本筛选）
 └── PAL-main/                  ← 实际代码
     ├── train_model.py         ★ 训练主循环 + 主动学习调度 + 文本先验接入
     ├── test_model.py          ★ 测试（已支持文本先验）
@@ -38,6 +39,7 @@ PAL+TATE/                      ← git 仓库根目录
     ├── components/
     │   ├── text_prior.py      ★★ 文本先验模块（TATE）—— 本分支核心新增
     │   ├── text_prompts.py    ★★ 单帧红外 prompt 列表
+    │   ├── credibility.py     ★★ CI 门控（S/K/CI + GMM 阈值）—— 替换 PAL 困难样本筛选
     │   ├── dataset_final_edge_copy_paste_final_2_img_path.py  数据集（返回 img/mask/edge）
     │   ├── utils_all_edge_copy_paste_final_2_img_path.py      DataLoader 封装
     │   ├── metric_new_crop.py 指标（IoU / nIoU / Pd / Fa）
@@ -46,6 +48,7 @@ PAL+TATE/                      ← git 仓库根目录
     ├── model/{MSDA,ACM,ALC,MLCL,ALCL,DNA,GGL,UIU}/*_no_sigmoid.py   8 个可选网络
     ├── tools/
     │   ├── test_text_prior.py ★ 文本先验自检脚本（不依赖数据集）
+    │   ├── test_ci_filter.py  ★ CI 门控自检脚本（纯 numpy，不依赖 GPU/CLIP）
     │   ├── coarse_anno.m, centroid_anno.m       点标注生成（MATLAB）
     ├── dataset/               【.gitignore 忽略】790MB 数据 + 伪标签工作池
     ├── imgs/                  【.gitignore 忽略】png 可视化
@@ -65,9 +68,14 @@ PAL+TATE/                      ← git 仓库根目录
 |---|---|---|
 | `components/text_prompts.py` | **新增** | 单帧红外 prompt 10 条（SeViL 13 条裁剪而来） |
 | `components/text_prior.py` | **新增** | `ClipTextEmbedder` + `TextPriorAttention`(TATE) + `attach_text_prior()` |
+| `components/credibility.py` | **新增** | CI 门控：组件提取/过点匹配、S、K(CLIP)、图级均值 CI、GMM 动态阈值 |
+| `CI_FILTER_CHANGELOG.md` | **新增** | CI 门控的完整改动记录、公式、校准实验与日志说明 |
+| `tools/test_ci_filter.py` | **新增** | CI 门控自检（组件/S/CI/漏点惩罚/GMM 阈值与放行率） |
 | `tools/test_text_prior.py` | **新增** | 自检脚本（模块 / MSDA 接入 / CLIP 编码） |
 | `PAL-main/TEXT_PRIOR_README.md` | **新增** | 使用说明 |
 | `train_model.py` | 改 | 顶部 7 个开关；模型构造后接入文本先验 |
+| `train_model.py` | 改 | **困难样本筛选改为 CI 门控（默认开启）**，原 PAL 判据保留在 `else` 分支；新增 `[CI-Filter]` 日志与 `ci_log/` |
+| `components/text_prior.py` | 改 | `ClipTextEmbedder` 增加 `keep_image_tower`：CI 门控复用同一份 CLIP 与文本嵌入 E |
 | `test_model.py` | 改 | 同样接入文本先验；`load_state_dict(strict=False)` + 不匹配提示 |
 | `model/MSDA/MSDA_no_sigmoid.py` | 改 | **修原版 bug**：5 处 DWT 反向硬编码 fp16 → 跟随 `dx.dtype` |
 
@@ -133,6 +141,49 @@ M_E = f_c( G ⊙ M + M )                   # 残差加权后再 1×1 conv
 
 ---
 
+## 3A. CI 门控：替换 PAL 的“困难样本筛选”（默认开启）
+
+> 背景：PAL 原 COU 判据（`utilts.nc_pred_mask`：点位漏检率 + 虚警比）每轮放行过多，
+> 伪标签池突变 → 训练震荡。改用 SeViL TAPF 的 `CI = 2SK/(S+K)` + GMM 动态阈值。
+> 完整记录（含校准实验数据）见 `CI_FILTER_CHANGELOG.md`；公式细节见
+> `PAL-main/components/credibility.py` 文件头。
+
+### 三步（每 `clear_epoch_gap=5` 轮一次，仅 enhancement 阶段）
+
+1. **阶段 A（纯几何，不耗 CLIP）**：连通域 → 按点标注分“过点组件 / 不过点组件”；
+   `虚警数/max(1,点数) > alarm_point_ration(5)` → 本轮不学，留在困难池。
+2. **阶段 B（CI，只对通过预筛的样本）**：
+   `S = 0.5*max(prob)+0.5*mean(prob)`（组件内）
+   `K = mean_i cos(CLIP_img(局部窗), E_i)`（E 与 TATE 共用）
+   `CI = 2SK/(S+K)`；未匹配点记 0；
+   **图级均值** `mean_ci = mean(各点 CI)`。
+3. **阶段 C+D**：对全体 `mean_ci` 拟合 GMM(2)，取高簇密度峰值作 `theta`（跨轮 EMA 平滑，
+   `<4` 样本回退池中位数）；**唯一判据** `mean_ci >= theta` → 进简单池。
+   随后复用 `deal_gen_mask_error_aera`（只留过点连通域 ∪ 点标注）+ `hard_sample_in`。
+
+### 必须知道的四个点
+
+1. **GMM 不传 `precisions_init`**（与 SeViL 的唯一刻意偏离）。CI 尺度 0.1~0.9，
+   SeViL 的先验方差 1.0 会让两分量重叠、退化成求众数 → 每轮固定放行 ~50%，
+   反而无法节流；默认初始化下双峰数据放行 ~25%。`tools/test_ci_filter.py` 有回归断言。
+2. **`mean_ci` 自带漏点惩罚**（未匹配点 CI=0），所以**不再需要** `lose_point_ratio` 爬坡；
+   但 enhancement 里仍保留该变量的计算（旧分支会用），CI 分支不依赖它。
+3. **单峰风险**：若某轮 CI 分布单峰（普遍自信/普遍糟糕），θ 只能砍一半——
+   这就是数量闸 k 存在的原因（它不依赖分布形状）。早期 `ratio=0.05` 直接压住入场量，
+   末尾 `ratio→1.0` 退化为不限制、完全交给 θ。`CI_USE_QUOTA=False` 可关（仅用于消融）。
+4. **`TEXT_PRIOR_RANDOM=True` 时 CI 也用随机文本**——这是“文本是否有信息量”消融的正确语义。
+
+### 上线前的快速判定（首个 `[CI-Filter]` 日志行）
+
+- `theta` 是否明显高于 `mean_ci p50`；
+- `avgK` 是否几乎恒定（若是，CI 退化为只看 S，需调 `CI_CROP_MIN/MAX`）；
+- 放行数是否**明显小于**原 PAL 一轮几百张。
+
+日志：主 txt 里的 `[CI-Filter]` 行 + `ci_theta.json` + `ci_log/ci_round_epochXXXX.jsonl`
+（逐样本 `mean_ci / 每点 CI / S / K / 点数 / 虚警数 / 是否放行`）。
+
+---
+
 ## 4. 运行方式
 
 ### 4.1 依赖
@@ -159,6 +210,8 @@ pip install git+https://github.com/openai/CLIP.git      # 或 pip install -e /wo
 cd PAL-main
 python tools/test_text_prior.py                    # 不需要 CLIP 权重
 python tools/test_text_prior.py --with_clip --clip_path /path/ViT-B-32.pt
+python tools/test_ci_filter.py                     # CI 门控纯 numpy 自检（无 GPU/CLIP/数据）
+python tools/test_ci_filter.py --with_clip --clip_path /path/ViT-B-32.pt   # 额外验证 CLIP 局部窗
 ```
 
 ### 4.4 训练 / 测试
@@ -216,6 +269,8 @@ MODEL_NAME = choose_model + '__' + choose_dataset + '__' + choose_dataset_type +
 | +TATE | 默认（真实文本） |
 | +TATE(random) | `TEXT_PRIOR_RANDOM=True` —— **验证文本是否真有信息量的关键消融** |
 | +TATE(no gate) | `TEXT_PRIOR_USE_GATE=False` |
+| 原 PAL 筛选（A/B） | `USE_CI_FILTER=False` |
+| CI 门控（默认） | `USE_CI_FILTER=True`（见 §3A / `CI_FILTER_CHANGELOG.md`） |
 
 固定 **seed / 数据集 / epoch 数 / GPU**；PAL 的主动学习池演化随机性大，
 建议至少 2 个 seed 取均值，否则容易把波动误判为增益。
