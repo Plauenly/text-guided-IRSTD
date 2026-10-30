@@ -95,6 +95,12 @@ def data_inital_make_add_points(origin_img_dir, origin_points_dir,TRAIN_IMG_DIR,
     input_image_path = origin_img_dir
     input_points_path = origin_points_dir
 
+    # 防御：自己建好输出目录。否则 cv2.imwrite 会静默失败（不抛异常），
+    # 导致"目录建了、文件没写进去"，下次再跑又因目录存在而跳过生成。
+    for _d in (TRAIN_IMG_DIR, TRAIN_MASK_DIR, train_points_dir,
+               nc_img_dir, nc_mask_dir, nc_points_dir):
+        make_dir(_d)
+
     # 从以上数据集来构建的训练池的位置（训练调度的环节）
     output_image_path = TRAIN_IMG_DIR       # ...train/choose/img
     output_masks_path = TRAIN_MASK_DIR      # ...train/choose/mask
@@ -178,10 +184,8 @@ def data_inital_make_add_points(origin_img_dir, origin_points_dir,TRAIN_IMG_DIR,
             cv2.imwrite(no_choose_out_points_path,mask)
 
     # 容易样本数量
-    
-    print("初始数据已生成，共生成样本张数：", len(os.listdir(output_image_path)))
-    print("初始数据已生成，共生成样本张数：", len(os.listdir(output_image_path)))
-    print("初始数据已生成，共生成样本张数：", len(os.listdir(output_image_path)))
+    print("初始数据已生成，choose(容易样本)张数：", len(os.listdir(output_image_path)))
+    print("初始数据已生成，no_choose(困难样本)张数：", len(os.listdir(no_choose_output_image_path)))
 
 
 

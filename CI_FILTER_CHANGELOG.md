@@ -161,3 +161,100 @@ python tools/test_ci_filter.py     # 纯 numpy 部分，无需 GPU/CLIP/数据
   - `avgK` 是否几乎恒定（若 K 方差极小，说明 CLIP 对红外小目标不敏感，CI 退化为只看 S）；
   - 放行数是否远小于 hard 池（目标：明显小于原 PAL 的一轮几百张）。
 - 若 `avgK` 退化，优先调整 `CI_CROP_MIN/MAX`（局部窗太小 → 无上下文；太大 → 目标占比过低）。
+
+---
+
+# 7. 后续改动：文本适配器 + ACM + 困难池排空（2026-10）
+
+## 7.1 改了哪些文件
+
+| 文件 | 状态 | 内容 |
+|---|---|---|
+| `PAL-main/components/cross_modal.py` | **新增** | `TextAdapter`（Ea = E + gate·MLP(E)）与 `AdaptiveCrossModalMask`（512 维 ACM）+ `attach_cross_modal` |
+| `PAL-main/components/text_prior.py` | 改 | `TextPriorAttention` 支持 `text_adapter`（TATE 与 ACM 共用同一实例） |
+| `PAL-main/components/credibility.py` | 改 | `CIPatchScorer.set_text_features()`：K 跟随适配器更新 |
+| `PAL-main/train_model.py` | 改 | 适配器/ACM 构造、ACM 损失 + warmup、`[Drain]` 困难池排空、日志 |
+| `PAL-main/tools/test_cross_modal.py` | **新增** | 适配器/ACM 自检（含反塌陷与梯度方向检查） |
+| `PAL-main/tools/analyze_text_ci.py` | **新增** | Step-0 离线体检：新 prompt 下的 K 分布/秩/与 GT 可见性的相关性 |
+
+## 7.2 ACM 的公式（与 SeViL 原式的三处必要修正）
+
+SeViL 原式在"128ch×16×16 bottleneck + 512 维 CLIP 文本"下有三处不成立：
+
+1. `out = α·out + text_mask`：`(N,256)+(N,512)` 维度不通；
+2. `MSE(out, text_feat)`：同上；
+3. **更要紧**：若写成残差式，`α→0` 时退化为"适配器猜被 mask 的 token"的纯文本任务，
+   视觉侧拿不到梯度 —— 模块白加。
+
+本实现（512 维直连，无旁路）：
+
+```
+E    = CLIP_text(prompts)                      [N,512]
+Ea   = E + gate*MLP(E)                         # 文本适配器，gate 初值 0
+En   = normalize(Ea);  keep = rand > 0.15       # 元素级掩码，不整行置零
+Q    = normalize(En * keep)                     # 被 mask 位置置 0
+V    = normalize(1x1conv_{128→512}(prefusion))  # [B,512,256]，K 与 V 共用
+attn = softmax(Q·Vᵀ/√512)                       # [B,N,256]
+out  = attn·V                                   # [B,N,512]
+loss = MSE(out, En)[被 mask 的元素]              # ← 只对 out 求损失，无残差旁路
+```
+
+`prefusion` = `stage.layer5_4` 的**输入**（`[64 + 16×4] = 128` 通道，16×16），用
+`register_forward_pre_hook` 捕获，不改模型源码。`grad_to_backbone=True` 时梯度回传
+MSDA 主干（目标：让主干特征里"读得出"文本语义）；置 False 则只训投影层/适配器。
+
+## 7.3 损失与调度
+
+```
+loss = edgeSCE_loss + λ_acm(epoch) · acm_loss
+λ_acm: 0 → ACM_LAMBDA(0.1)，在 ACM_WARMUP_EPOCHS(=10) 内线性 warmup
+```
+日志（每 epoch）：`acm_lambda / acm_loss / masked_mse / kept_mse`；warmup 结束后追加
+`adapter_gate` 与 `tate_alpha` 两个标量——这是判断"模型到底用了多少文本"的直接证据。
+
+**判据**：`masked_mse` 应显著低于 `kept_mse` 且两者都下降。若 `masked_mse` 不降或
+`adapter_gate ≈ 0`，说明视觉侧读不出语义 / 模型不用文本，此时 ACM 只是多了一组参数。
+
+## 7.4 筛选用的 K 跟随适配器
+
+`CIPatchScorer.set_text_features(Ea)` 在每轮 CI 计算前调用，K 与 TATE 同源。
+代价：K 不再是独立标尺，`TEXT_PRIOR_RANDOM` 消融时必须同时打开，否则无法区分
+"适配器拟合"与"文本语义真的有用"。
+
+## 7.5 困难池排空（保险机制）
+
+refinement 阶段（`epoch > 0.8N`）每 `clear_epoch_gap` 轮：
+
+```
+prog   = (epoch - 0.8N) / (0.15N)        # 0.8N → 0.95N
+frac   = 0.2 + 0.8*prog                  # 每轮排空占比（占剩余困难池）
+k      = ceil(frac * n_left)
+pick   = 剩余困难池按最近一轮 mean_ci 降序取前 k
+伪标签 = 点标注（这些样本没有任何过点组件），随后由 FIU 自演化
+```
+日志：`[Drain] epoch 剩余 / 本轮 / 比例 / 剩余后`。
+不区分"不可学样本"（按需求），A 类退化样本也会进来，但初始标签只有点，不会把大块
+伪前景带进训练。
+
+## 7.6 参数量与算力（估算）
+
+| 模块 | 结构 | 参数量 |
+|---|---|---|
+| `TextAdapter` | 512→512→512 残差 MLP + gate | **525,313** (~0.53M) |
+| `AdaptiveCrossModalMask.proj` | 1×1 conv 128→512, bias=False | **65,536** |
+| 合计新增 | | **~590.8K** |
+
+算力（B=16、256×256 输入、16×16 bottleneck）：投影 ≈ 0.27 GMACs/step，
+注意力 ≈ 42 MMACs，适配器 ≈ 5 MMACs；相对 MSDA 主干（约 1.5~2 GMACs）约 **+10~20%**，
+实际墙钟预计 **+3~8%**（GEMM 效率高）。显存增量 < 50 MB。
+如显存/时间紧张，可把 `TEXT_ADAPTER_HIDDEN` 降到 256（适配器参数降到 262K）。
+
+## 7.7 验证顺序
+
+```bash
+python tools/test_cross_modal.py                     # 无需数据，CPU 可跑
+python tools/analyze_text_ci.py --n 300              # Step-0：K 分布/秩/相关性
+python tools/analyze_text_ci.py --n 300 --prompts_file my_prompts.py --var MY_PROMPTS --compare
+```
+先看 `analyze_text_ci.py` 的两个数：K 的 CV（目标 >15%）与 `Spearman(K, GT对比度)`；
+再决定是否值得跑完整训练。

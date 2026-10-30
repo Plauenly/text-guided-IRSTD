@@ -184,6 +184,51 @@ M_E = f_c( G ⊙ M + M )                   # 残差加权后再 1×1 conv
 
 ---
 
+## 3B. 文本适配器 + ACM + 困难池排空（默认开启）
+
+> 目标：让"文本"真正参与（而非只有一个标量门控），并把 CI 门控后期锁死的困难样本收回训练。
+> 公式、参数与验证方式见 `CI_FILTER_CHANGELOG.md §7`；实现见
+> `PAL-main/components/cross_modal.py`。
+
+### 三个模块
+
+1. **TextAdapter**（`Ea = E + gate·MLP(E)`，gate 零初始化）：在缓存的 CLIP 文本嵌入上微调，
+   代价 ~0.5M 参数 / 每步 5 MMACs。TATE 与 ACM 共用同一实例（`model.text_adapter`，
+   只注册一次，state_dict 不重复）。
+2. **ACM（512 维直连）**：`prefusion(128ch,16x16) --1x1conv--> V(512)`，
+   `Q = normalize(Ea 元素级掩码 15%)`，`out = softmax(Q·Vᵀ/√512)·V`，
+   `loss = MSE(out, normalize(Ea))` **只在被 mask 的元素上**。
+   - **只对 `attn·V` 求损失**（无残差旁路），否则 α→0 会退化成纯文本任务、视觉侧拿不到梯度；
+   - `ACM_GRAD_TO_BACKBONE=True` 时梯度回传主干（让特征"读得出"文本语义）；
+   - 捕获点是 `stage.layer5_4` 的**输入**（融合前），用 `forward_pre_hook`。
+3. **排空**（`CI_DRAIN`）：refinement 阶段（>0.8N）按最近一轮 `mean_ci` 降序、
+   以 0.2→1.0 的占比逐步把剩余困难样本收进简单池，初始伪标签 = 点标注，随后由 FIU 演化。
+   这补齐了 PAL 原版 `lose_point_ratio→1.0`"后期全收"的语义。
+
+### 关键开关（`train_model.py` 顶部）
+
+```python
+USE_TEXT_ADAPTER=True  TEXT_ADAPTER_HIDDEN=512  TEXT_ADAPTER_GATE_INIT=0.0
+USE_ACM=True  ACM_LAMBDA=0.1  ACM_WARMUP_EPOCHS=10  ACM_MASK_RATIO=0.15
+ACM_GRAD_TO_BACKBONE=True
+CI_DRAIN=True  CI_DRAIN_START_RATIO=0.8  CI_DRAIN_END_RATIO=0.95  CI_DRAIN_START_FRAC=0.2
+```
+
+### 必须看的三条日志
+
+- `acm_loss / masked_mse / kept_mse`：`masked` 应显著低于 `kept` 且都下降；
+- `adapter_gate` 与 `tate_alpha`：判断模型"到底用了多少文本"的直接证据；
+- `[Drain]` 行：剩余池应单调下降并在 0.95N 前归零。
+
+### 注意
+
+- **筛选用的 K 跟随适配器**（`CIPatchScorer.set_text_features`），所以 K 不再是独立标尺；
+  做 `TEXT_PRIOR_RANDOM` 消融时必须同时打开，否则分不清"适配器拟合"与"文本语义"。
+- 排空不区分"不可学样本"（按要求）：A 类退化样本也会进来，初始标签只有点，
+  不会把大块伪前景带进训练。
+
+---
+
 ## 4. 运行方式
 
 ### 4.1 依赖

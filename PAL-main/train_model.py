@@ -25,6 +25,7 @@ from components.text_prompts import SINGLE_FRAME_IR_PROMPTS
 from components.credibility import (CIPatchScorer, extract_components, sample_mean_ci,
                                     spurious_ratio, gmm_threshold, fallback_threshold,
                                     admit_ratio)
+from components.cross_modal import TextAdapter, attach_cross_modal
 
 import cv2
 from torch.utils.data import Dataset
@@ -103,6 +104,30 @@ CI_ADMIT_RATIO_INIT = 0.05 # 每轮最多放行比例（占困难池）的起点
 CI_CROP_SIDE_RATIO = 1.5   # CLIP 局部窗边长 = 系数 × 过点组件 bbox 长边
 CI_CROP_MIN = 16           # 局部窗边长下限（像素）：红外目标只有几个像素
 CI_CROP_MAX = 64           # 局部窗边长上限（像素）
+## =================================================================
+
+## ============ 文本适配器 + 跨模态掩码（ACM）相关参数 ============
+## 设计: Ea = E + gate*MLP(E)（gate 零初始化）；ACM 把 MSDA 融合前的 128ch/16x16
+## 特征投影到 512 维，用注意力从视觉特征里重建被掩码的文本语义。
+## 公式与数值细节见 components/cross_modal.py 文件头；改动记录见 CI_FILTER_CHANGELOG.md
+USE_TEXT_ADAPTER = True        # 文本适配器（Ea）；False -> 直接用缓存的 CLIP E
+TEXT_ADAPTER_HIDDEN = 512      # 适配器隐层维度
+TEXT_ADAPTER_GATE_INIT = 0.0   # 残差门控初值（0 = 训练初期恒等）
+USE_ACM = True                 # 自适应跨模态掩码损失
+ACM_LAMBDA = 0.1               # ACM 损失权重（前 ACM_WARMUP_EPOCHS 个 epoch 线性 warmup）
+ACM_WARMUP_EPOCHS = 10         # 前 N 个 epoch 线性 warmup（0 -> ACM_LAMBDA）
+ACM_MASK_RATIO = 0.15          # 文本元素级掩码比例
+ACM_GRAD_TO_BACKBONE = True    # True -> 梯度回传到 MSDA 主干（让特征学会读出语义）
+## =================================================================
+
+## ============ 困难样本排空（保险机制） ============
+## refinement 阶段（epoch > final_epoch_ratio）把剩余困难样本按 mean_ci 由高到低
+## 逐步收进简单池，初始伪标签 = 点标注，之后由 FIU 自演化。对应 PAL 原版
+## lose_point_ratio -> 1.0 “后期全部收下”的语义。
+CI_DRAIN = True
+CI_DRAIN_START_RATIO = 0.8     # 从总 epoch 的 80% 开始
+CI_DRAIN_END_RATIO = 0.95      # 到 95% 排完
+CI_DRAIN_START_FRAC = 0.2      # 每轮排空比例的起点（占剩余困难池）
 ## =================================================================
 
 ## 根据给定的choose_model, choose_dataset, choose_dataset_type生成对应文件夹作为工作空间,且加一个时间码确保文件夹的独一无二性,不存在覆盖问题 
@@ -238,8 +263,13 @@ def main():
     cal_mean = float(0.38625179481616323)
     cal_std = float(0.14124445249304624)
 
-    def train_fn(loader, model, optimizer, loss_fn, scaler, epoch, choose_model=choose_model):
+    def train_fn(loader, model, optimizer, loss_fn, scaler, epoch, choose_model=choose_model,
+                 acm=None, acm_lambda=0.0):
         model.train()
+        # ACM 只在 λ>0 时才捕获特征（关闭时 pre-hook 直接返回，不占显存）
+        if acm is not None:
+            acm.set_enabled(acm_lambda > 0.0)
+        acm_losses = []
         # 当ncols = 0不会显示进度条，仅显示一些关键信息。tqdm类不会影响loader的正常使用，仅仅在loader被请求新值更新进度条
         loop = tqdm(loader, ncols=fixed_length)
 
@@ -292,6 +322,14 @@ def main():
             _, IoU = iou_metric.get()
             _, nIoU = nIoU_metric.get()
 
+            # ---- ACM：用融合前的视觉特征重建被掩码的文本语义 ----
+            # 注意：必须在 forward 之后、backward 之前取，且只对 loss 求一次。
+            if acm is not None and acm_lambda > 0.0:
+                l_acm = acm.forward_loss()
+                if l_acm is not None:
+                    loss = loss + acm_lambda * l_acm
+                    acm_losses.append(float(l_acm.detach()))
+
             # 混合精度的后向传播
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -320,7 +358,8 @@ def main():
         # SigmoidMetric.get() 返回的 IoU 是 shape=(1,) 的 numpy.ndarray，
         # 直接传入内置 round() 会报 "type numpy.ndarray doesn't define __round__ method"，
         # 这里统一转成 python float，避免后续打印/比较出错。
-        return float(IoU), float(nIoU), float(np.mean(train_losses))
+        return float(IoU), float(nIoU), float(np.mean(train_losses)), \
+               (float(np.mean(acm_losses)) if acm_losses else float('nan'))
 
     # loss_fn = Edge_loss
     def val_fn(loader, model, loss_fn, epoch):
@@ -405,6 +444,8 @@ def main():
     # 门控也使用随机文本，这正是“文本到底有没有信息量”消融所需的语义）。
     _embedder = None
     ci_scorer = None
+    text_adapter = None
+    acm = None
     if USE_TEXT_PRIOR or USE_CI_FILTER:
         _embedder = ClipTextEmbedder(
             SINGLE_FRAME_IR_PROMPTS,
@@ -421,6 +462,22 @@ def main():
             text_embedding = torch.randn(text_embedding.shape, generator=_g)
             print('[TextPrior] **消融模式**：使用随机文本嵌入（random text embedding）')
 
+        # ---- 文本适配器：Ea = E + gate*MLP(E)，gate 零初始化 ----
+        # 只注册一次（挂在 model 上），TATE 与 ACM 共享同一实例，
+        # 避免 state_dict 出现重名副本、同时保证 optimizer 能拿到它的参数。
+        if USE_TEXT_ADAPTER:
+            text_adapter = TextAdapter(text_embedding.size(1),
+                                       hidden=TEXT_ADAPTER_HIDDEN,
+                                       gate_init=TEXT_ADAPTER_GATE_INIT)
+            try:
+                text_adapter = text_adapter.to(next(model.parameters()).device)
+            except StopIteration:
+                pass
+            model.add_module('text_adapter', text_adapter)
+            n_ad = sum(p.numel() for p in text_adapter.parameters())
+            print(f'[TextAdapter] Ea = E + gate*MLP(E)，gate_init={TEXT_ADAPTER_GATE_INIT}，'
+                  f'参数量={n_ad} (~{n_ad/1e3:.1f}K)')
+
         if USE_TEXT_PRIOR:
             attach_text_prior(
                 model,
@@ -429,6 +486,7 @@ def main():
                 hidden_dim=TEXT_PRIOR_HIDDEN,
                 use_gate=TEXT_PRIOR_USE_GATE,
                 gate_init=TEXT_PRIOR_GATE_INIT,
+                text_adapter=text_adapter,
             )
 
         if USE_CI_FILTER:
@@ -442,6 +500,16 @@ def main():
             )
             print('[CI-Filter] 已启用 CI 门控：S=概率图组件置信度，K=CLIP 图文余弦相似度，'
                   'theta=图级均值 CI 的 GMM 高簇峰值（跨轮 EMA 平滑）')
+
+        if USE_ACM:
+            acm, _acm_hook = attach_cross_modal(
+                model, text_embedding, adapter=text_adapter,
+                choose_model=choose_model,
+                mask_ratio=ACM_MASK_RATIO,
+                grad_to_backbone=ACM_GRAD_TO_BACKBONE,
+            )
+            print(f'[ACM] λ={ACM_LAMBDA}（warmup {ACM_WARMUP_EPOCHS} epoch），'
+                  f'损失只算 attn·V 对未掩码文本的重建，无残差旁路')
     # =========================================================
 
     loss_fn = edgeSCE_loss
@@ -484,6 +552,7 @@ def main():
     ci_theta_file = os.path.join(save_model_file_path, 'ci_theta.json')
     ci_log_dir = os.path.join(save_model_file_path, 'ci_log')
     ci_theta_ema = None
+    ci_mean_by_name = {}      # 最近一轮的图级均值 CI，供 refinement 阶段的排空排序用
     make_dir(ci_log_dir)
 
     # 命令行参数：python train_model.py --resume1
@@ -530,11 +599,39 @@ def main():
         '\n---------------------------------------start--------------------------------------------------\n')
     save_file.write(datetime.now().strftime("%Y-%m-%d, %H:%M:%S\n"))
 
-    # and后面的语句是我后期加上，避免重复创建训练集
-    if (choose_dataset_type == 'masks_coarse' or choose_dataset_type == 'masks_centroid') and not os.path.exists(TRAIN_IMG_DIR):
-        data_inital_make_add_points(origin_img_dir, origin_points_dir, TRAIN_IMG_DIR, TRAIN_MASK_DIR, train_points_dir,
-                                    nc_img_dir,
-                                    nc_mask_dir, nc_points_dir, crop_size=10) # 10*10区域
+    # and后面的语句是我后期加上，避免重复创建训练集。
+    # ⚠️ 判据必须是"池子里有没有样本"，而不是"目录存不存在"：
+    #    __main__ 里会先用 make_dir() 建好 6 个空目录，若按目录存在与否判断，
+    #    首次运行会跳过初始池生成 → choose/no_choose 都是 0 张 →
+    #    get_loaders 报 num_samples=0（cv2.imwrite 对不存在的目录是静默失败）。
+    if choose_dataset_type == 'masks_coarse' or choose_dataset_type == 'masks_centroid':
+        _choose_empty = (not os.path.exists(TRAIN_IMG_DIR)) or len(os.listdir(TRAIN_IMG_DIR)) == 0
+        _no_choose_empty = (not os.path.exists(nc_img_dir)) or len(os.listdir(nc_img_dir)) == 0
+
+        if _choose_empty and _no_choose_empty:
+            print("训练池为空，开始生成初始伪标签池（高斯+Canny，确定性，无随机）...")
+            data_inital_make_add_points(origin_img_dir, origin_points_dir, TRAIN_IMG_DIR, TRAIN_MASK_DIR,
+                                        train_points_dir, nc_img_dir,
+                                        nc_mask_dir, nc_points_dir, crop_size=10)  # 10*10区域
+        elif _choose_empty != _no_choose_empty:
+            # 一边空一边非空：说明池子被外部打断/手工删过，继续跑会让 A/B 不可比
+            raise RuntimeError(
+                f"训练池状态不一致（choose空={_choose_empty}, no_choose空={_no_choose_empty}）。\n"
+                f"  请检查并二选一：\n"
+                f"    (a) 换一个新的 MODEL_NAME 重新生成（推荐，A/B 起点才一致）\n"
+                f"    (b) 同时删除以下两个目录后重跑：\n"
+                f"        {demo_train_input_path}/train/choose\n"
+                f"        {demo_train_input_path}/train/no_choose")
+
+        # 生成/复用后强校验：避免空池跑到 epoch1 才在 DataLoader 里崩
+        if len(os.listdir(TRAIN_IMG_DIR)) == 0:
+            raise RuntimeError(
+                f"初始训练池生成后仍为 0 张。请检查：\n"
+                f"  图像目录: {origin_img_dir}\n"
+                f"  点标注目录: {origin_points_dir}\n"
+                f"  两者文件名是否一一对应、mask 是否为 0/255 点标注。")
+        print(f"初始池就绪：choose={len(os.listdir(TRAIN_IMG_DIR))} 张，"
+              f"no_choose={len(os.listdir(nc_img_dir))} 张")
     else:
         pass
 
@@ -657,6 +754,14 @@ def main():
                         ci_skipped = 0      # 被虚警预筛挡下的样本数（留在困难池）
                         auto_in = []        # 无点标注的样本：沿用原逻辑直接进简单池
 
+                        # K 跟着文本适配器走（同一轮内固定，避免阈值与排序不同源）
+                        if ci_scorer is not None:
+                            _E_ci = text_embedding.to(DEVICE)
+                            if text_adapter is not None:
+                                with torch.no_grad():
+                                    _E_ci = text_adapter(_E_ci)
+                            ci_scorer.set_text_features(_E_ci)
+
                         for idx, (img, _, name, h, w) in tqdm(enumerate(test_loader)):
                             img = img.to(device=DEVICE)
                             with torch.no_grad():
@@ -718,6 +823,9 @@ def main():
 
                         # 阶段 D：放行（theta 决定"够不够格"，k 决定"这轮最多进几个"）
                         passed = [r for r in ci_records if r['mean_ci'] >= theta]
+                        # 记录本轮 mean_ci，供 refinement 阶段的排空排序使用
+                        for r in ci_records:
+                            ci_mean_by_name[r['name']] = r['mean_ci']
                         if CI_USE_QUOTA:
                             # 数量闸：k = 放行比例 × 当前困难池总数；比例随阶段从
                             # CI_ADMIT_RATIO_INIT 升到 1.0（斜率同 PAL 的 lose_point_ratio）。
@@ -854,6 +962,42 @@ def main():
                                 pred, prev_label, thresh_Tb, thresh_k, [h_i, w_i], degen=degen)
                             current_binary_pred = current_binary_pred * 255
                             cv2.imwrite(os.path.join(TRAIN_MASK_DIR, name[i]), current_binary_pred)
+
+                    # ---- 保险机制：排空困难池 ----
+                    # 背景：CI 门控在后期会让 mean_ci≡0 的样本永久停在困难池（实测 61/68 张
+                    # 48 轮未进），而 PAL 原语义是 lose_point_ratio->1.0 后期全部收下。
+                    # 这里在 refinement 阶段按 mean_ci 从高到低逐步收，初始伪标签 = 点标注，
+                    # 之后由上面的 FIU 自演化。
+                    if CI_DRAIN and ci_scorer is not None:
+                        n_left = len(os.listdir(nc_img_dir))
+                        if n_left > 0:
+                            _start = int(NUM_EPOCHS * CI_DRAIN_START_RATIO)
+                            _span = max(1, int(NUM_EPOCHS * (CI_DRAIN_END_RATIO - CI_DRAIN_START_RATIO)))
+                            _prog = min(1.0, max(0.0, (epoch - _start + 1) / _span))
+                            _frac = CI_DRAIN_START_FRAC + (1.0 - CI_DRAIN_START_FRAC) * _prog
+                            _k = max(1, int(math.ceil(_frac * n_left)))
+                            _names = sorted(os.listdir(nc_img_dir),
+                                            key=lambda n: ci_mean_by_name.get(n, -1.0), reverse=True)
+                            _pick = _names[:_k]
+                            for _n in _pick:
+                                _pts = cv2.imread(os.path.join(nc_points_dir, _n), cv2.IMREAD_GRAYSCALE)
+                                if _pts is None:
+                                    continue
+                                # 初始伪标签只能是点（这些样本没有任何过点组件）
+                                cv2.imwrite(os.path.join(nc_mask_dir, _n), _pts)
+                            _moved = 0
+                            for _n in _pick:
+                                if not os.path.exists(os.path.join(nc_mask_dir, _n)):
+                                    continue
+                                move_files([_n], nc_img_dir, TRAIN_IMG_DIR)
+                                move_files([_n], nc_mask_dir, TRAIN_MASK_DIR)
+                                move_files([_n], nc_points_dir, train_points_dir)
+                                _moved += 1
+                            drain_msg = (f"[Drain] epoch:{epoch + 1} 剩余:{n_left} 本轮:{_moved} "
+                                         f"比例:{_frac:.2f} 剩余后:{len(os.listdir(nc_img_dir))}")
+                            print(drain_msg)
+                            save_file.write(drain_msg + "\n")
+                            save_file.flush()
             else:
                 pass
             
@@ -883,7 +1027,36 @@ def main():
             sys.exit(0)
 
 
-        train_mioU, train_nioU, train_loss = train_fn(train_loader, model, optimizer, loss_fn, scaler, epoch)
+        # ---- ACM 损失权重 warmup（0 -> ACM_LAMBDA）----
+        if acm is not None and USE_ACM:
+            acm_lambda = ACM_LAMBDA * min(1.0, (epoch + 1) / max(1, ACM_WARMUP_EPOCHS))
+        else:
+            acm_lambda = 0.0
+
+        train_mioU, train_nioU, train_loss, train_acm_loss = train_fn(
+            train_loader, model, optimizer, loss_fn, scaler, epoch,
+            acm=acm, acm_lambda=acm_lambda)
+
+        if USE_ACM and acm is not None and acm_lambda > 0:
+            _st = getattr(acm, 'last_stats', {}) or {}
+            acm_msg = (f"当前epoch:{epoch + 1}  acm_lambda:{acm_lambda:.4f}  "
+                       f"acm_loss:{train_acm_loss:.5f}  "
+                       f"masked_mse:{_st.get('masked', float('nan')):.5f}  "
+                       f"kept_mse:{_st.get('unmasked', float('nan')):.5f}")
+            print(acm_msg)
+            save_file.write(acm_msg + "\n")
+            if acm_lambda >= ACM_LAMBDA - 1e-9:
+                # warmup 结束后记录门控值，用来判断模型到底“用了多少”文本
+                _g = []
+                if text_adapter is not None:
+                    _g.append(f"adapter_gate={float(text_adapter.gate):.4f}")
+                try:
+                    _g.append(f"tate_alpha={float(model.text_prior.alpha):.4f}")
+                except Exception:
+                    pass
+                if _g:
+                    save_file.write(f"当前epoch:{epoch + 1}  " + "  ".join(_g) + "\n")
+            save_file.flush()
 
         if epoch + 1 > num_start_test_epochs:   # 其实上面伪标签的更新的操作都可以挪到validation阶段来做,没必要再去重复用test_pred函数
             mioU, nioU, test_loss, fa, pd = val_fn(val_loader, model, loss_fn, epoch)

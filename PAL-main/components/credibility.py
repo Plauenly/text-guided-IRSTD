@@ -166,6 +166,17 @@ class CIPatchScorer:
             self._dtype = torch.float32
 
     # ------------------------------------------------------------------ #
+    def set_text_features(self, text_features):
+        """更新文本嵌入（文本适配器每轮都会被更新，K 需跟着变）。
+
+        说明：适配后的 Ea 会随训练变化，所以 CI 门控的 K 与 TATE 保持同源。
+        副作用是 K 的标尺不再独立于网络——做“文本是否真的有用”的消融时，
+        需要同时把 TEXT_PRIOR_RANDOM 打开，否则无法区分“适配器拟合”与“文本语义”。
+        """
+        text = text_features.detach().float().to(self.device)
+        self.text_features = text / text.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    # ------------------------------------------------------------------ #
     def _crop(self, gray, bbox):
         """以 bbox 中心取正方形局部窗并预处理成 CLIP 输入 [3,224,224]。"""
         H, W = gray.shape

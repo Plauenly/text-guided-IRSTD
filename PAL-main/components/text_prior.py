@@ -117,11 +117,14 @@ class TextPriorAttention(nn.Module):
     """
 
     def __init__(self, feat_dim, text_dim=512, hidden_dim=256,
-                 use_gate=True, gate_init=0.0):
+                 use_gate=True, gate_init=0.0, text_adapter=None):
         super().__init__()
         self.feat_dim = feat_dim
         self.text_dim = text_dim
         self.use_gate = use_gate
+        # 文本适配器（可选）：Ea = E + gate*MLP(E)，由 components/cross_modal.py 提供。
+        # 这里只持引用、不注册，避免与 model.add_module('text_adapter', ...) 重复进 state_dict。
+        object.__setattr__(self, '_text_adapter', text_adapter)
 
         # f_mlp: 文本 -> 视觉特征子空间（输出维度对齐 feat_dim，便于逐元素相乘）
         self.mlp_vis = nn.Sequential(
@@ -159,8 +162,12 @@ class TextPriorAttention(nn.Module):
         Returns:
             attention_map: [B, 1, H, W]，空间维 softmax 归一化
         """
-        # ---- Eq.1: E -> f_mlp -> 平均 -> 广播为 E_p ----
+        # ---- Eq.1: E -> [适配器] -> f_mlp -> 平均 -> 广播为 E_p ----
         text = self.text_embedding.to(device=feat.device, dtype=torch.float32)
+        adapter = getattr(self, '_text_adapter', None)
+        if adapter is not None:
+            # 适配器每步重新计算（其参数在变）；ACM 共用同一个实例。
+            text = adapter(text)
         text = self.mlp_vis(text)                      # [N, feat_dim]
         text = text.mean(dim=0)                        # [feat_dim]  (1/N)Σ
         text = text.view(1, -1, 1, 1)
@@ -220,7 +227,7 @@ MODEL_TEXT_PRIOR_CFG = {
 
 def attach_text_prior(model, text_embedding, choose_model='MSDA',
                       hidden_dim=256, use_gate=True, gate_init=0.0,
-                      verbose=True):
+                      text_adapter=None, verbose=True):
     """把 TextPriorAttention 以 forward hook 形式挂到模型上（不修改模型源码）。
 
     注意：模块通过 model.add_module() 注册，因此 model.parameters() 会自动包含它，
@@ -233,6 +240,9 @@ def attach_text_prior(model, text_embedding, choose_model='MSDA',
         hidden_dim (int): f_mlp 隐层维度。
         use_gate (bool): 是否使用残差门控。
         gate_init (float): 门控初值。
+        text_adapter (nn.Module|None): 文本适配器（Ea = E + gate*MLP(E)）。
+            传入后 TATE 与 ACM 共用同一个实例；注意它应由调用方注册一次
+            （`model.add_module('text_adapter', adapter)`）。
         verbose (bool): 是否打印接入信息。
 
     Returns:
@@ -252,6 +262,7 @@ def attach_text_prior(model, text_embedding, choose_model='MSDA',
         hidden_dim=hidden_dim,
         use_gate=use_gate,
         gate_init=gate_init,
+        text_adapter=text_adapter,
     )
     text_attn.set_text_embedding(text_embedding)
 
@@ -281,5 +292,6 @@ def attach_text_prior(model, text_embedding, choose_model='MSDA',
         print(f'[TextPrior] 已接入 {choose_model}: '
               f'注入层={cfg["layer_name"]}, feat_dim={cfg["feat_dim"]}, '
               f'可训练参数={n_params} (~{n_params/1e3:.2f}K), '
-              f'gate={use_gate}(init={gate_init})')
+              f'gate={use_gate}(init={gate_init}), '
+              f'adapter={"on" if text_adapter is not None else "off"}')
     return text_attn, handle

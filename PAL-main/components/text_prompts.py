@@ -24,26 +24,39 @@
 # =============================================================================
 SINGLE_FRAME_IR_PROMPTS = [
     # 亮度 / 温度：目标通常比背景亮，温差明显
-    "The target is usually brighter than the surrounding background, with a higher temperature, making it stand out in the image.",
+    # "The target is usually brighter than the surrounding background, with a higher temperature, making it stand out in the image.",
+    "The small targets may not necessarily be bright, but they will certainly stand out as distinct anomalies within the image.",
     # 形状：受噪声干扰形状不规则、边缘模糊
+    # "The target shape is irregular due to background noise and surrounding interference, showing blurred edge contours.",
     "The target shape is irregular due to background noise and surrounding interference, showing blurred edge contours.",
     # 尺寸：只占几个到十几个像素
-    "The target occupies only a few pixels in the image, typically ranging from several to a dozen pixels.",
+    # "The target occupies only a few pixels in the image, typically ranging from several to a dozen pixels.",
+    "The small targets occupy only a few pixels in the image, typically ranging from several to a dozen pixels.",
     # 对比度：与背景有对比度，因而更突出
-    "The target often has a contrast with the background, making it more prominent in the image.",
-    # 热源特性：与背景温度差异显著
-    "The target typically as a thermal source has distinct temperature characteristics, with a significant difference from the background temperature.",
+    # "The target often has a contrast with the background, making it more prominent in the image.",
+    "The small targets often exhibit a certain degree of contrast with their immediate background.",
+    # 热源特性：与背景温度差异显著（太学术了）
+    # "The target typically as a thermal source has distinct temperature characteristics, with a significant difference from the background temperature.",
     # 孤立性：周围没有其他显著特征点
-    "The target is usually isolated in the image, with no other significant feature points around it.",
+    # "The target is usually isolated in the image, with no other significant feature points around it.",
+    "The small targets are usually isolated in the image, with no other significant feature points around it.",
     # 易被淹没：亮度和信号弱于背景噪声
-    "The target is prone to being obscured, due to the low brightness and the weak signal compared to background noise.",
+    # "The target is prone to being obscured, due to the low brightness and the weak signal compared to background noise.",
+    "The small targets are prone to being obscured, due to the low brightness and the weak signal compared to background noise.",
     # 纹理相似：灰度模糊，与背景纹理相近
-    "The target has a surface texture similar to the background, appearing gray and blurry, indicating its temperature.",
+    # "The target has a surface texture similar to the background, appearing gray and blurry, indicating its temperature.",
+    "The small targets have a surface texture similar to the background, appearing gray and blurry.",
     # 语义类别：热源/飞机/车辆等感兴趣目标
-    "The target is specific types of objects, such as heat sources, aircraft, vehicles, etc., that are parts of interest in the scene.",
+    # "The target is specific types of objects, such as heat sources, aircraft, vehicles, etc., that are parts of interest in the scene.",
+    "The small targets are specific types of objects, such as heat sources, aircraft, vehicles, drone, etc., that are parts of interest in the scene.",
     # 信噪比：信噪比低，难以从背景噪声中检测
-    "The target typically has a low signal-to-noise ratio, making it harder to detect from background noise.",
+    # "The target typically has a low signal-to-noise ratio, making it harder to detect from background noise.",
+    "The small targets typically have a low signal-to-noise ratio, making it harder to detect from background noise.",
+    # 介绍一下红外图像的背景：城市楼栋间，水面上，高空中，森林树木间，田野上
+    "The small targets all appear in infrared images, which were taken against backgrounds such as among city buildings, over water, high in the sky, among forest trees, over open fields, and so on."
+
 ]
+
 
 
 # =============================================================================
