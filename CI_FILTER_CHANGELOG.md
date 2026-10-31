@@ -258,3 +258,74 @@ python tools/analyze_text_ci.py --n 300 --prompts_file my_prompts.py --var MY_PR
 ```
 先看 `analyze_text_ci.py` 的两个数：K 的 CV（目标 >15%）与 `Spearman(K, GT对比度)`；
 再决定是否值得跑完整训练。
+
+---
+
+# 8. 高斯 Focal Loss 替换 edgeSCE（2026-10）
+
+## 8.1 改了哪些文件
+
+| 文件 | 状态 | 内容 |
+|---|---|---|
+| `PAL-main/components/heatmap.py` | **新增** | 由点标注生成高斯热图（σ、多目标 max 合并、峰值强制 1、`from_label` 自适应） |
+| `PAL-main/loss/gaussian_focal_loss.py` | **新增** | `GaussianFocalLoss`（logit 稳定版，target=pseudo/heatmap 两种） |
+| `PAL-main/components/dataset_final_edge_copy_paste_final_2_img_path.py` | 改 | 训练分支：新增 `point_dir`/`crop_fov`/`aux_mode`/`sigma*`；固定视野缩放 + pad/crop；伪标签与点堆成 **2 通道 mask** 一起做几何增强；返回热图（保持 3 元组） |
+| `PAL-main/components/utils_all_edge_copy_paste_final_2_img_path.py` | 改 | `get_loaders` 透传上述参数 |
+| `PAL-main/train_model.py` | 改 | `LOSS_TYPE` 开关、`PATCH_SIZE 256→320`、`CROP_FOV=0.8`、GF 参数块、梯度裁剪、逐 epoch 指标日志 |
+| `PAL-main/tools/test_heatmap.py` | **新增** | 热图自检（无 torch 可跑） |
+
+## 8.2 公式（target=伪标签，热图做权重）
+
+```
+g = 点标注高斯热图 ∈[0,1]（σ=1.5，max 合并，峰值=1）
+p = sigmoid(z)
+
+L = [ Σ_pos (1+(W-1)·g)·(1-p)^α·softplus(-z)
+    + Σ_neg (1-g)^γ·p^α·softplus(z) ]
+    / ( num_pos + Σ_neg (1-g)^γ )        # by_pos_neg
+```
+- `log p = -softplus(-z)`、`log(1-p) = -softplus(z)`：与 `-log(p)` 等价但**不会 log(0)**
+  （CornerNet 原版直接 log 概率、mmdet 版用 `eps=1e-12`，在 fp16 下都会出 NaN）。
+- 默认 `α=2, γ=4, W=4`（W 与原 PAL `edge_weight=4` 对齐，但权重落在**点附近**而不是轮廓上）。
+- `by_pos_neg` 的分母 ≈ 有效负像素数 ⇒ 与 patch 尺寸无关，实测量级 **0.12~0.17**
+  （`by_pos` 同条件下是 120~180，差 3 个数量级，会把 ACM 的 λ=0.1 淹没）。
+- `GF_TARGET='heatmap'` 为 CornerNet 原式备选：正样本=热图峰值，**能抑制伪标签膨胀**，
+  但与"用伪标签训练"的语义不一致，默认关闭。
+
+## 8.3 数据侧：固定视野缩放（CROP_FOV）
+
+```
+side = min(H,W)
+s = PATCH/(CROP_FOV*side)   若 side >= PATCH/CROP_FOV   # 大图下采样
+s = PATCH/side              否则                        # 小图整图放大
+```
+`PATCH=320, CROP_FOV=0.8` ⇒ XDU(512) 缩放 **0.781**、NUAA(256) 缩放 1.25。
+
+实测（200 张 XDU，`INTER_AREA`）缩放 0.75~0.85 的代价：
+目标峰值 −2.5%、GT 面积按 s² 缩小（48→27~36 px）、<4px 的目标占 2%、
+下采样→复原的 PSNR 47.6 dB。**结论：损害很小、可选 0.78**。
+
+点的坐标用 **数学缩放**（`round(x·s)`）重建，不要对 1 px 点图做 `INTER_NEAREST`（会丢点）。
+
+## 8.4 新增日志（每 epoch）
+
+```
+task:{task_loss} p_pos:{...} p_neg:{...} pos_px:{...} pred_fg:{...} empty:{...}
+```
+- `task`：本 epoch 平均任务损失（**不含** ACM 项），用于与旧 edgeSCE 对比；
+- `p_pos`：伪标签前景像素处的平均预测概率（学得好不好，目标 >0.6）；
+- `p_neg`：背景处的平均预测概率（目标 <0.05）；
+- `pos_px`：每张图正样本像素数（`GF_SKIP_EMPTY` 跳过的样本不计）；
+- `pred_fg`：预测前景面积中位数（`p>0.5` 的像素数），**防膨胀监控**；
+- `empty`：因"裁不到目标"被跳过的样本占比（随机裁剪的必然产物）。
+
+## 8.5 验证
+
+```bash
+python tools/test_heatmap.py        # 无需 torch/GPU
+```
+覆盖：峰值严格=1、多目标 max 合并（中点 0.80 而非 1.60）、空标注、边界点、
+`from_label` 的 σ 折算与 clamp、softplus 恒等式与饱和区行为。
+
+> `GaussianFocalLoss` 与 dataset 的 torch 路径只能在训练机验证；
+> 首次运行请先看 2~3 个 epoch 的 `[Loss]` 与 `task/p_pos/p_neg/pred_fg/empty` 日志。

@@ -21,6 +21,13 @@ def get_loaders(
     val_transform,
     num_workers=4,
     pin_memory=True,       # 加快数据传输到显存的速度，代价是占用内存的大小变大
+    train_pointdir=None,   # 点标注目录（训练时生成高斯热图用）
+    crop_fov=None,         # 固定视野比例（见 SirstDataset docstring）
+    aux_mode='edge',       # 'heatmap' | 'edge'
+    gf_sigma=1.5,
+    gf_sigma_mode='fixed',
+    gf_sigma_min=1.0,
+    gf_sigma_max=4.0,
 ):
     train_ds = SirstDataset(
         image_dir=train_dir,
@@ -28,6 +35,13 @@ def get_loaders(
         patch_size=patch_size,
         transform=train_transform,
         mode='train',
+        point_dir=train_pointdir,
+        crop_fov=crop_fov,
+        aux_mode=aux_mode,
+        sigma=gf_sigma,
+        sigma_mode=gf_sigma_mode,
+        sigma_min=gf_sigma_min,
+        sigma_max=gf_sigma_max,
     )
 
     train_loader = DataLoader(

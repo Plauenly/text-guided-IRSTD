@@ -19,6 +19,7 @@ from components.dataset_final_edge_copy_paste_final_2_img_path import pad_to_mul
 from components.cal_mean_std import Calculate_mean_std
 from components.metric_new_crop import *
 from loss.Edge_loss import edgeSCE_loss
+from loss.gaussian_focal_loss import GaussianFocalLoss
 from utilts import *
 from components.text_prior import ClipTextEmbedder, attach_text_prior
 from components.text_prompts import SINGLE_FRAME_IR_PROMPTS
@@ -60,7 +61,8 @@ num_start_test_epochs = 100   #default: 100
 NUM_WORKERS = 4
 
 IMAGE_SIZE = 256
-PATCH_SIZE = 256
+PATCH_SIZE = 320        # 训练 patch（原 256）：320=16*20，能被 bottleneck 的 /16 整除
+CROP_FOV = 0.8          # 固定视野：crop 占原图 80%（512图缩放 0.781，256图缩放1.25）
 PATCH_SIZE_test = 1024
 CP_PROBABILITY = 0.5
 # lose_point_ratio = 0.2
@@ -104,6 +106,27 @@ CI_ADMIT_RATIO_INIT = 0.05 # 每轮最多放行比例（占困难池）的起点
 CI_CROP_SIDE_RATIO = 1.5   # CLIP 局部窗边长 = 系数 × 过点组件 bbox 长边
 CI_CROP_MIN = 16           # 局部窗边长下限（像素）：红外目标只有几个像素
 CI_CROP_MAX = 64           # 局部窗边长上限（像素）
+## =================================================================
+
+## ============ 高斯 Focal Loss（替换 edgeSCE）相关参数 ============
+## 设计：target 仍是**伪标签**（与 PAL 训练语义一致），高斯热图只做权重：
+##   target=1: (1+(W-1)g)·(1-p)^α·softplus(-z)
+##   target=0: (1-g)^γ·p^α·softplus(z)
+## 归一化 by_pos_neg（分母 ≈ 有效负像素数）→ 损失量级与 patch 尺寸无关，
+## 与旧 edgeSCE 同档（≈0.1~1），ACM 的 λ 不需要重标。详见 loss/gaussian_focal_loss.py
+LOSS_TYPE = 'gauss_focal'      # 'gauss_focal' | 'edgeSCE'（回退到原 PAL）
+GF_SIGMA_MODE = 'fixed'        # 'fixed' | 'from_label'
+GF_SIGMA_PX = 1.5              # 高斯核宽度（patch 像素）
+GF_SIGMA_MIN = 1.0
+GF_SIGMA_MAX = 4.0
+GF_ALPHA = 2.0                 # focal 正负调制指数 (1-p)^α / p^α
+GF_GAMMA = 4.0                 # 负样本高斯衰减指数 (1-g)^γ
+GF_POS_WEIGHT = 4.0            # W：核内正向最大权重（对应原 PAL edge_weight=4）
+GF_NORM = 'by_pos_neg'         # 'by_pos_neg' | 'by_area' | 'by_pos'
+GF_TARGET = 'pseudo'           # 'pseudo' | 'heatmap'（后者=CornerNet 原式，仅对照）
+GF_POS_EPS = 1e-4
+GF_SKIP_EMPTY = True           # 不含目标的 crop 不参与损失
+GF_GRAD_CLIP = 1.0             # 梯度裁剪（None/0 关闭）
 ## =================================================================
 
 ## ============ 文本适配器 + 跨模态掩码（ACM）相关参数 ============
@@ -264,12 +287,13 @@ def main():
     cal_std = float(0.14124445249304624)
 
     def train_fn(loader, model, optimizer, loss_fn, scaler, epoch, choose_model=choose_model,
-                 acm=None, acm_lambda=0.0):
+                 acm=None, acm_lambda=0.0, grad_clip=None):
         model.train()
         # ACM 只在 λ>0 时才捕获特征（关闭时 pre-hook 直接返回，不占显存）
         if acm is not None:
             acm.set_enabled(acm_lambda > 0.0)
         acm_losses = []
+        stat_buffers = {}       # 损失函数自报的统计量（mean_p_pos / pred_fg_px ...）
         # 当ncols = 0不会显示进度条，仅显示一些关键信息。tqdm类不会影响loader的正常使用，仅仅在loader被请求新值更新进度条
         loop = tqdm(loader, ncols=fixed_length)
 
@@ -334,8 +358,18 @@ def main():
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             train_losses.append(loss.item())
+            # 高斯 focal loss 量级可能偏大，做一次梯度裁剪（AMP 下必须先 unscale）
+            if grad_clip and grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()     # 根据本轮训练数据是否出现溢出，来动态调整放大的倍数因子
+
+            # 收集本 batch 的损失统计（GaussianFocalLoss 才有 last_stats）
+            _st = getattr(loss_fn, 'last_stats', None)
+            if _st:
+                for _k, _v in _st.items():
+                    stat_buffers.setdefault(_k, []).append(float(_v))
 
             ''' 正常的后向传播
             optimizer.zero_grad()
@@ -359,7 +393,8 @@ def main():
         # 直接传入内置 round() 会报 "type numpy.ndarray doesn't define __round__ method"，
         # 这里统一转成 python float，避免后续打印/比较出错。
         return float(IoU), float(nIoU), float(np.mean(train_losses)), \
-               (float(np.mean(acm_losses)) if acm_losses else float('nan'))
+               (float(np.mean(acm_losses)) if acm_losses else float('nan')), \
+               {k: float(np.mean(v)) for k, v in stat_buffers.items()}
 
     # loss_fn = Edge_loss
     def val_fn(loader, model, loss_fn, epoch):
@@ -512,7 +547,18 @@ def main():
                   f'损失只算 attn·V 对未掩码文本的重建，无残差旁路')
     # =========================================================
 
-    loss_fn = edgeSCE_loss
+    # ---- 损失函数选择：高斯 focal（默认） or 原 PAL 的 edgeSCE ----
+    if LOSS_TYPE == 'gauss_focal':
+        loss_fn = GaussianFocalLoss(alpha=GF_ALPHA, gamma=GF_GAMMA,
+                                    pos_weight=GF_POS_WEIGHT, norm=GF_NORM,
+                                    target=GF_TARGET, pos_eps=GF_POS_EPS,
+                                    skip_empty=GF_SKIP_EMPTY)
+        print(f'[Loss] GaussianFocal: α={GF_ALPHA} γ={GF_GAMMA} W={GF_POS_WEIGHT} '
+              f'norm={GF_NORM} target={GF_TARGET} σ={GF_SIGMA_PX}({GF_SIGMA_MODE}) '
+              f'skip_empty={GF_SKIP_EMPTY}')
+    else:
+        loss_fn = edgeSCE_loss
+        print('[Loss] 使用原 PAL edgeSCE_loss')
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
     iou_metric = SigmoidMetric()
@@ -662,7 +708,7 @@ def main():
 
         print(epoch)
         if choose_dataset_type == 'mask':
-            train_loader, val_loader = get_loaders(
+            train_loader, val_loader = get_loaders(  # 永远不会用
                 origin_img_dir,
                 origin_points_dir,
                 VAL_IMG_DIR,
@@ -1020,6 +1066,13 @@ def main():
                 val_transforms,
                 NUM_WORKERS,
                 PIN_MEMORY,
+                train_pointdir=train_points_dir,      # 高斯热图由点标注生成
+                crop_fov=CROP_FOV,
+                aux_mode=('heatmap' if LOSS_TYPE == 'gauss_focal' else 'edge'),
+                gf_sigma=GF_SIGMA_PX,
+                gf_sigma_mode=GF_SIGMA_MODE,
+                gf_sigma_min=GF_SIGMA_MIN,
+                gf_sigma_max=GF_SIGMA_MAX,
             )
 
         else:
@@ -1033,9 +1086,26 @@ def main():
         else:
             acm_lambda = 0.0
 
-        train_mioU, train_nioU, train_loss, train_acm_loss = train_fn(
+        train_mioU, train_nioU, train_loss, train_acm_loss, gf_stats = train_fn(
             train_loader, model, optimizer, loss_fn, scaler, epoch,
-            acm=acm, acm_lambda=acm_lambda)
+            acm=acm, acm_lambda=acm_lambda, grad_clip=GF_GRAD_CLIP)
+
+        # ---- 高斯 focal loss 的逐 epoch 统计 ----
+        # task_loss 不包含 ACM 项，便于与旧 edgeSCE 直接对比；
+        # mean_p_pos/mean_p_neg：正/负样本处的平均预测概率（学得好不好）；
+        # pos_px：每张图的正样本像素数；pred_fg_px：预测前景面积中位数（防膨胀）；
+        # empty_ratio：因“裁不到目标”被跳过的样本占比（GF_SKIP_EMPTY 生效时才有）。
+        if gf_stats:
+            gf_msg = (f"当前epoch:{epoch + 1}  "
+                      f"task:{gf_stats.get('task_loss', float('nan')):.5f}  "
+                      f"p_pos:{gf_stats.get('mean_p_pos', float('nan')):.4f}  "
+                      f"p_neg:{gf_stats.get('mean_p_neg', float('nan')):.4f}  "
+                      f"pos_px:{gf_stats.get('pos_px', 0):.1f}  "
+                      f"pred_fg:{gf_stats.get('pred_fg_px', 0):.0f}  "
+                      f"empty:{gf_stats.get('empty_ratio', 0):.3f}")
+            print(gf_msg)
+            save_file.write(gf_msg + "\n")
+            save_file.flush()
 
         if USE_ACM and acm is not None and acm_lambda > 0:
             _st = getattr(acm, 'last_stats', {}) or {}

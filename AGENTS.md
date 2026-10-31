@@ -229,6 +229,47 @@ CI_DRAIN=True  CI_DRAIN_START_RATIO=0.8  CI_DRAIN_END_RATIO=0.95  CI_DRAIN_START
 
 ---
 
+## 3C. 尺寸统一约定：**原图坐标 + 只 pad 不 resize**（commit cfbcdf7 起）
+
+一句话：**除了训练时对 image+mask 做同一个窗口的 256 随机裁剪，其余环节（val / test / FIU /
+伪标签落盘 / CI 筛选）全部在原图坐标上做，只把右/下 pad 到 32 的倍数，绝不 resize。**
+
+- 训练：`random_crop(image, mask, 256)` 一次调用共用同一 `h_start/w_start`；图小于 256 先右下 pad。
+  `train_transform` 里**没有** crop/resize，只有翻转/旋转/亮度/噪声 + Normalize。
+- val/test/FIU：`pad_to_multiple(...,32)` 后返回原图 `h,w`；预测裁回 `[:, :, :h, :w]`，指标与
+  `update_gt_update_degen_corr` 都在原图坐标；伪标签按原图坐标写盘。
+- 尺寸不一 ⇒ **val/FIU 的 DataLoader 一律 `batch_size=1`**；只有 `h,w>1024` 才 `unfold/fold` 分块
+  （`stride=patch_size`，当前三个数据集最大 512，不触发）。
+- 兼容旧残留 256×256 伪标签：`match_mask_to_image()` / `utilts.py` 内 nearest resize 兜底并 `[warn]`；
+  出现该警告说明池子没重生成，应删池重跑。
+- ⚠️ 历史坑：`0b63f19`~`cfbcdf7` 之前训练用 random_crop(256)、val/FIU 用整图 resize 到 256，
+  伪标签在 256 尺度演化后再放回原图 —— 几何不一致 + `33×33` 核相对覆盖面积漂移（33×33 方块成因之一）。
+- 仍未统一的是**输入尺度上下文**：训练看 256 原生裁块（512² 图上可能裁空），FIU 看整图。
+
+---
+
+## 3C. 高斯 Focal Loss（默认替换 edgeSCE）
+
+`LOSS_TYPE='gauss_focal'`，`LOSS_TYPE='edgeSCE'` 可一键回退。
+
+- **热图**：`components/heatmap.py`，由**点标注**生成，σ=1.5（patch 像素）、半径 3σ、
+  多目标取 max、峰值强制 1.0（否则 CornerNet 的 `pos==1` 判定会失效）。
+- **损失**：`loss/gaussian_focal_loss.py`，target=**伪标签**，热图只做权重：
+  核内权重 `1+(W-1)g`（W=4，点处最大）、核外 `(1-g)^γ`；`by_pos_neg` 归一化
+  （量级 ≈0.12~0.17，与 edgeSCE 同档，ACM 的 λ 不用改）。
+- **crop**：`PATCH_SIZE=320`、`CROP_FOV=0.8`（512 图缩放 0.781、256 图 1.25）。
+  点的坐标用数学缩放重建，不对点图重采样。
+- **几何增强**：伪标签与点堆成 2 通道 mask 一起送 albumentations
+  （避免依赖 `masks=[...]` 关键字，版本兼容性更稳）。
+- **日志**：`task / p_pos / p_neg / pos_px / pred_fg / empty`，含义见
+  `CI_FILTER_CHANGELOG.md §8.4`。
+- **自检**：`python tools/test_heatmap.py`（无 torch 可跑）。
+
+⚠️ 注意：`target=pseudo` 意味着损失不会对抗伪标签膨胀（那是 `GF_TARGET='heatmap'` 的能力）。
+方块膨胀仍由 FIU + CI 门控控制。
+
+---
+
 ## 4. 运行方式
 
 ### 4.1 依赖
